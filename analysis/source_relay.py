@@ -14,4 +14,4 @@ def compute_source_relay_summary(df, min_departures=1000):
 
     return summary[summary['total_departures'] >= min_departures].sort_values(
         'inheritance_rate', ascending=False
-    )
+)
