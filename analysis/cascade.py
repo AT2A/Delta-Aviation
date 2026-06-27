@@ -88,3 +88,5 @@ def trace_all_cascades(G):
         all_events.extend(trace_cascades(legs))
 
     return all_events
+
+
