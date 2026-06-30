@@ -4,15 +4,23 @@ import pickle
 import pandas
 import pandas as pd
 from analysis.pipeline import run_full_reconciliation
-from analysis.queries import compute_route_delay_summary, compute_tail_summary, get_tail_chain
+from analysis.queries import compute_route_delay_summary, compute_tail_summary, get_tail_chain, get_aircraft_state
+from analysis.disruption import get_downstream_legs, find_swap_candidates
 from pydantic import BaseModel
-from typing import List
-
-    
+from typing import List, Optional
+from enum import Enum
+from fastapi.middleware.cors import CORSMiddleware
 
 DATA_DIR = Path(__file__).parent.parent / "data"
 
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 state = {}
 
@@ -35,7 +43,27 @@ class Route(BaseModel):
 class TailSummary(BaseModel):
     tail_number: str
     total_legs: int
+    
+class AircraftStatus(str, Enum):
+    not_operating = "not_operating"
+    not_yet_started = "not_yet_started"
+    taxiing_out = "taxiing_out"
+    in_flight = "in_flight"
+    taxiing_in = "taxiing_in"
+    parked = "parked"
+    cancelled = "cancelled"
 
+class AircraftState(BaseModel):
+    tail_number: str
+    status: AircraftStatus
+    origin: Optional[str] = None
+    destination: Optional[str] = None
+class DisruptRequest(BaseModel):
+    tail_number: str
+    date: str
+    time: str
+    origin: str
+    destination: str
 
 @app.on_event("startup")
 def load_data():
@@ -47,7 +75,12 @@ def load_data():
     state['airport_table'] = run_full_reconciliation(state['df'], state["G"])
     state['route_table'] = compute_route_delay_summary(state['df'])
     state['tail_summary'] = compute_tail_summary(state['G'])
-
+    legs_by_tail = {}
+    for u, v, d in state["G"].edges(data=True):
+        legs_by_tail.setdefault(d['tail_number'], []).append((u, v, d))
+    for tail in legs_by_tail:
+        legs_by_tail[tail].sort(key=lambda e: e[2]['crs_dep_dt'])
+    state['legs_by_tail'] = legs_by_tail
 
 @app.get("/debug/node-count")
 def node_count():
@@ -127,3 +160,68 @@ def get_tail_full_history(tail_number: str):
     legs = get_tail_chain(state["G"], tail_number)
 
     return {"legs": [shape_leg(u, v, d) for u, v, d in legs]}
+
+
+class StateResponse(BaseModel):
+    aircraft: List[AircraftState]
+    
+@app.get("/state", response_model=StateResponse)
+def get_state(date: str, time: str):
+    query_datetime = pd.to_datetime(f"{date} {time}")
+
+    results = []
+    for t in state["tail_summary"]:
+        tail_number = t["tail_number"]
+        all_legs = state['legs_by_tail'].get(tail_number, [])
+        legs = [leg for leg in all_legs if leg[2]['flight_date'] == date]
+        aircraft_state = get_aircraft_state(legs, query_datetime)
+        results.append({"tail_number": tail_number, **aircraft_state})
+
+    return {"aircraft": results}
+
+
+class DisruptResponse(BaseModel):
+    tail_number: str
+    cancelled_leg: str
+    downstream_legs: List[str]
+    total_cascade_minutes: float
+    swap_candidates: List[str]
+    
+@app.post("/disrupt", response_model=DisruptResponse)
+def disrupt_flight(request: DisruptRequest):
+    cancelled_leg, downstream = get_downstream_legs(
+        state['legs_by_tail'],
+        request.tail_number,
+        request.date,
+        request.origin,
+        request.destination,
+    )
+
+    if cancelled_leg is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No leg found from {request.origin} to {request.destination} "
+                   f"for {request.tail_number} on {request.date}"
+        )
+
+    downstream_legs = [f"{u}->{v}" for u, v, d in downstream]
+
+    total_cascade_minutes = sum(
+        d['arr_delay'] for _, _, d in downstream
+        if d['arr_delay'] is not None and not pd.isna(d['arr_delay']) and d['arr_delay'] > 0
+    )
+
+    swap_candidates = find_swap_candidates(
+        state['legs_by_tail'],
+        request.origin,
+        request.date,
+        request.time,
+    )
+
+    return {
+        "tail_number": request.tail_number,
+        "cancelled_leg": f"{request.origin}->{request.destination}",
+        "downstream_legs": downstream_legs,
+        "total_cascade_minutes": total_cascade_minutes,
+        "swap_candidates": swap_candidates,
+    }

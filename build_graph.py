@@ -13,15 +13,17 @@ NEEDED_COLS = [
     'Tail_Number', 'FlightDate', 'Origin', 'Dest', 'OriginCityName', 'DestCityName',
     'CRSDepTime', 'DepTime', 'CRSArrTime', 'ArrTime',
     'CRSDepDatetime', 'CRSArrDatetime', 'DepDatetime', 'ArrDatetime',
+    'WheelsOffDatetime', 'WheelsOnDatetime',
     'DepDelay', 'ArrDelay', 'LateAircraftDelay',
     'Cancelled', 'Diverted', 'Distance',
+    'TaxiOut', 'TaxiIn', 'WheelsOff', 'WheelsOn',
 ]
- 
+
 def load_data(path):
     df = pd.read_csv(path, usecols=NEEDED_COLS, low_memory=False)
-    
+
     #Parse Datetime
-    for col in ['CRSDepDatetime', 'CRSArrDatetime', 'DepDatetime', 'ArrDatetime']:
+    for col in ['CRSDepDatetime', 'CRSArrDatetime', 'DepDatetime', 'ArrDatetime', 'WheelsOffDatetime', 'WheelsOnDatetime']:
         df[col] = pd.to_datetime(df[col], errors='coerce')
     
     #Drop row with no tail num
@@ -116,6 +118,10 @@ def build_graph(chains, df):
                 turnaround_to_next=turnaround_minutes,
                 turn_type=turn_type,
                 is_fragile=is_fragile,
+                taxi_out=row['TaxiOut'],
+                taxi_in=row['TaxiIn'],
+                wheels_off=row['WheelsOffDatetime'],
+                wheels_on=row['WheelsOnDatetime'],
             )
             n_edges += 1
     print(f'  {n_edges:,} flight edges added')
