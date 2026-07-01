@@ -31,6 +31,9 @@ class Airport(BaseModel):
     betweenness: float
     weighted_betweenness: float
     is_zero_betweenness: bool
+    is_reliable: bool
+    lat: float
+    lon: float
 class Route(BaseModel):
     Origin: str
     Dest: str
@@ -92,8 +95,14 @@ class AirportsResponse(BaseModel):
 
 @app.get("/airports", response_model=AirportsResponse)
 def get_airports():
-    columns = ['total_departures', 'inheritance_rate', 'betweenness', 'weighted_betweenness', 'is_zero_betweenness']
+    columns = ['total_departures', 'inheritance_rate', 'betweenness', 'weighted_betweenness', 'is_zero_betweenness', 'is_reliable']
     trimmed = state["airport_table"][columns].reset_index()
+
+    lats = {code: data['lat'] for code, data in state["G"].nodes(data=True)}
+    lons = {code: data['lon'] for code, data in state["G"].nodes(data=True)}
+    trimmed['lat'] = trimmed['Origin'].map(lats)
+    trimmed['lon'] = trimmed['Origin'].map(lons)
+
     return {"airports": trimmed.to_dict(orient='records')}
 
 
@@ -225,3 +234,34 @@ def disrupt_flight(request: DisruptRequest):
         "total_cascade_minutes": total_cascade_minutes,
         "swap_candidates": swap_candidates,
     }
+    
+class AirportBasic(BaseModel):
+    Origin: str
+    lat: float
+    lon: float
+    total_legs: int
+
+class AirportsAllResponse(BaseModel):
+    airports: List[AirportBasic]
+
+@app.get("/airports/all", response_model=AirportsAllResponse)
+def get_all_airports():
+    tail_counts = {t["tail_number"]: t["total_legs"] for t in state["tail_summary"]}
+    
+    # count departures per airport from the graph nodes
+    airport_departures = {}
+    for u, v, d in state["G"].edges(data=True):
+        airport_departures[u] = airport_departures.get(u, 0) + 1
+
+    result = []
+    for code, data in state["G"].nodes(data=True):
+        if data.get("lat") is None:
+            continue
+        result.append({
+            "Origin": code,
+            "lat": data["lat"],
+            "lon": data["lon"],
+            "total_legs": airport_departures.get(code, 0),
+        })
+
+    return {"airports": result}

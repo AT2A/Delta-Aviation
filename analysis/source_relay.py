@@ -1,7 +1,7 @@
 import pandas as pd
 
 
-def compute_source_relay_summary(df, min_departures=1000):
+def compute_source_relay_summary(df):
     totals = df.groupby('Origin').size()
     inherited = df.groupby('Origin')['LateAircraftDelay'].apply(lambda x: (x > 0).sum())
 
@@ -11,7 +11,6 @@ def compute_source_relay_summary(df, min_departures=1000):
     })
     summary['originated_count'] = summary['total_departures'] - summary['inherited_count']
     summary['inheritance_rate'] = summary['inherited_count'] / summary['total_departures']
+    summary['is_reliable'] = summary['total_departures'] >= 1000
 
-    return summary[summary['total_departures'] >= min_departures].sort_values(
-        'inheritance_rate', ascending=False
-)
+    return summary.sort_values('inheritance_rate', ascending=False)
