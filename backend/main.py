@@ -6,6 +6,7 @@ import pandas as pd
 from analysis.pipeline import run_full_reconciliation
 from analysis.queries import compute_route_delay_summary, compute_tail_summary, get_tail_chain, get_aircraft_state
 from analysis.disruption import get_downstream_legs, find_swap_candidates
+from analysis.geo import great_circle_interpolate, great_circle_path
 from pydantic import BaseModel
 from typing import List, Optional
 from enum import Enum
@@ -43,6 +44,7 @@ class Route(BaseModel):
     total_flights: int
     cancellation_rate: float
     diverted_count: int
+    path: Optional[List[List[float]]] = None
 class TailSummary(BaseModel):
     tail_number: str
     total_legs: int
@@ -61,6 +63,8 @@ class AircraftState(BaseModel):
     status: AircraftStatus
     origin: Optional[str] = None
     destination: Optional[str] = None
+    lat: Optional[float] = None
+    lon: Optional[float] = None
 class DisruptRequest(BaseModel):
     tail_number: str
     date: str
@@ -77,6 +81,21 @@ def load_data():
     print("Dataframe loaded:", len(state["df"]), "rows")
     state['airport_table'] = run_full_reconciliation(state['df'], state["G"])
     state['route_table'] = compute_route_delay_summary(state['df'])
+
+    lats = {code: data.get('lat') for code, data in state["G"].nodes(data=True)}
+    lons = {code: data.get('lon') for code, data in state["G"].nodes(data=True)}
+
+    def route_path(row):
+        o_lat, o_lon = lats.get(row['Origin']), lons.get(row['Origin'])
+        d_lat, d_lon = lats.get(row['Dest']), lons.get(row['Dest'])
+        if None in (o_lat, o_lon, d_lat, d_lon):
+            return None
+        return great_circle_path(o_lat, o_lon, d_lat, d_lon)
+
+    routes_with_path = state['route_table'].reset_index()
+    routes_with_path['path'] = routes_with_path.apply(route_path, axis=1)
+    state['route_table'] = routes_with_path.set_index(['Origin', 'Dest'])
+
     state['tail_summary'] = compute_tail_summary(state['G'])
     legs_by_tail = {}
     for u, v, d in state["G"].edges(data=True):
@@ -173,10 +192,17 @@ def get_tail_full_history(tail_number: str):
 
 class StateResponse(BaseModel):
     aircraft: List[AircraftState]
-    
+
+# Statuses where the aircraft hasn't left `origin` yet -- position it there.
+# taxiing_in/parked position at `destination`; in_flight is interpolated separately.
+ORIGIN_STATUSES = {"not_yet_started", "taxiing_out", "cancelled"}
+
 @app.get("/state", response_model=StateResponse)
 def get_state(date: str, time: str):
     query_datetime = pd.to_datetime(f"{date} {time}")
+
+    lats = {code: data['lat'] for code, data in state["G"].nodes(data=True)}
+    lons = {code: data['lon'] for code, data in state["G"].nodes(data=True)}
 
     results = []
     for t in state["tail_summary"]:
@@ -184,7 +210,41 @@ def get_state(date: str, time: str):
         all_legs = state['legs_by_tail'].get(tail_number, [])
         legs = [leg for leg in all_legs if leg[2]['flight_date'] == date]
         aircraft_state = get_aircraft_state(legs, query_datetime)
-        results.append({"tail_number": tail_number, **aircraft_state})
+
+        origin_lat, origin_lon = lats.get(aircraft_state['origin']), lons.get(aircraft_state['origin'])
+        dest_lat, dest_lon = lats.get(aircraft_state['destination']), lons.get(aircraft_state['destination'])
+
+        lat = lon = None
+        if aircraft_state['status'] == 'in_flight':
+            wheels_off = aircraft_state['wheels_off']
+            wheels_on = aircraft_state['wheels_on']
+            has_timing = (
+                pd.notna(wheels_off) and pd.notna(wheels_on) and wheels_on > wheels_off
+            )
+            if has_timing and None not in (origin_lat, origin_lon, dest_lat, dest_lon):
+                frac = (query_datetime - wheels_off) / (wheels_on - wheels_off)
+                frac = max(0.0, min(1.0, float(frac)))
+                lat, lon = great_circle_interpolate(origin_lat, origin_lon, dest_lat, dest_lon, frac)
+            else:
+                # missing timing/coords -- fall back to destination
+                lat, lon = dest_lat, dest_lon
+        else:
+            position_code = (
+                aircraft_state['origin']
+                if aircraft_state['status'] in ORIGIN_STATUSES
+                else aircraft_state['destination']
+            )
+            lat = lats.get(position_code)
+            lon = lons.get(position_code)
+
+        results.append({
+            "tail_number": tail_number,
+            "status": aircraft_state['status'],
+            "origin": aircraft_state['origin'],
+            "destination": aircraft_state['destination'],
+            "lat": lat,
+            "lon": lon,
+        })
 
     return {"aircraft": results}
 
@@ -193,6 +253,10 @@ class DisruptResponse(BaseModel):
     tail_number: str
     cancelled_leg: str
     downstream_legs: List[str]
+    # STUB metric: sum of pre-existing historical arr_delay on downstream legs.
+    # Not a simulated cascade -- identical regardless of whether this leg is
+    # actually cancelled. Real induced-delay propagation via turnaround_to_next
+    # is Day 11 scope, shared with swap-ranking logic.
     total_cascade_minutes: float
     swap_candidates: List[str]
     
@@ -214,6 +278,11 @@ def disrupt_flight(request: DisruptRequest):
         )
 
     downstream_legs = [f"{u}->{v}" for u, v, d in downstream]
+
+    # STUB: this is NOT a simulated cascade -- it sums pre-existing historical
+    # arr_delay on downstream legs, which is identical whether or not this leg
+    # (or any leg resolving to the same cancelled_index) is actually cancelled.
+    # Real simulation (propagating induced delay through turnaround_to_next)
 
     total_cascade_minutes = sum(
         d['arr_delay'] for _, _, d in downstream

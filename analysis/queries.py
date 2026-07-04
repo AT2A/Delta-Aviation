@@ -68,6 +68,8 @@ def get_aircraft_state(legs, query_datetime):
             'status': 'not_operating',
             'origin': None,
             'destination': None,
+            'wheels_off': None,
+            'wheels_on': None,
         }
     owning_leg = find_owning_leg(legs, query_datetime)
     if owning_leg is None:
@@ -75,6 +77,8 @@ def get_aircraft_state(legs, query_datetime):
             'status': 'not_yet_started',
             'origin': legs[0][0],
             'destination': None,
+            'wheels_off': None,
+            'wheels_on': None,
         }
     u, v, d = owning_leg
     status = classify_aircraft_status(d, query_datetime)
@@ -82,4 +86,6 @@ def get_aircraft_state(legs, query_datetime):
         'status': status,
         'origin': u,
         'destination': v,
+        'wheels_off': d['wheels_off'],
+        'wheels_on': d['wheels_on'],
     }

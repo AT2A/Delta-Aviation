@@ -1,24 +1,18 @@
-import MapView from "./MapView"
-import Sidebar from "./Sidebar"
-import { useState, useEffect } from "react"
-
+import { BrowserRouter, Routes, Route } from "react-router-dom"
+import NavBar from "./components/NavBar"
+import Overview from "./pages/Overview"
+import Live from "./pages/Live"
+ 
 function App() {
-  const [airports, setAirports] = useState([])
-
-  useEffect(() => {
-    fetch("/airports")
-      .then(res => res.json())
-      .then(data => setAirports(data.airports))
-  }, [])
-
   return (
-    <div style={{ display: "flex", width: "100vw", height: "100vh" }}>
-      <Sidebar airports={airports} />
-      <div style={{ flex: 1 }}>
-        <MapView />
-      </div>
-    </div>
+    <BrowserRouter>
+      <NavBar />
+      <Routes>
+        <Route path="/" element={<Overview />} />
+        <Route path="/replay" element={<Live />} />
+      </Routes>
+    </BrowserRouter>
   )
 }
-
+ 
 export default App
