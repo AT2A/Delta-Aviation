@@ -1,18 +1,23 @@
 from fastapi import FastAPI, HTTPException
 from pathlib import Path
 import pickle
-import pandas
 import pandas as pd
+import asyncio
+from concurrent.futures import ProcessPoolExecutor
+from functools import partial
 from analysis.pipeline import run_full_reconciliation
-from analysis.queries import compute_route_delay_summary, compute_tail_summary, get_tail_chain, get_aircraft_state
-from analysis.disruption import get_downstream_legs, find_swap_candidates
+from analysis.queries import compute_route_delay_summary, compute_tail_summary, get_aircraft_state, build_flight_frame_from_graph
+from analysis.disruption import get_downstream_legs, find_swap_candidates, rank_candidates, compute_recovery_improvement, RANKING_MODES, _build_route_duration_table
+from analysis.centrality import build_weighted_graph, compute_betweenness_centrality
 from analysis.geo import great_circle_interpolate, great_circle_path
+from backend.solver_worker import solve as solve_aircraft_down, init_worker
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from enum import Enum
 from fastapi.middleware.cors import CORSMiddleware
 
 DATA_DIR = Path(__file__).parent.parent / "data"
+OPTIMAL_SOLVER_TIMEOUT_SECONDS = 20
 
 app = FastAPI()
 
@@ -71,15 +76,32 @@ class DisruptRequest(BaseModel):
     time: str
     origin: str
     destination: str
+    mode: str = "all_factors_combined"
 
 @app.on_event("startup")
 def load_data():
     with open(DATA_DIR / "delta_rotation_graph.pkl", "rb") as f:
         state["G"] = pickle.load(f)
-    state["df"] = pandas.read_csv(DATA_DIR / "delta_ontime_with_datetimes.csv", low_memory=False)
+    state["df"] = build_flight_frame_from_graph(state["G"])
     print("Graph loaded:", state["G"].number_of_nodes(), "nodes")
-    print("Dataframe loaded:", len(state["df"]), "rows")
-    state['airport_table'] = run_full_reconciliation(state['df'], state["G"])
+    print("Flight frame built from graph:", len(state["df"]), "rows")
+
+    legs_by_tail = {}
+    airport_departures = {}
+    for u, v, d in state["G"].edges(data=True):
+        legs_by_tail.setdefault(d['tail_number'], []).append((u, v, d))
+        airport_departures[u] = airport_departures.get(u, 0) + 1
+    for tail in legs_by_tail:
+        legs_by_tail[tail].sort(key=lambda e: e[2]['crs_dep_dt'])
+    state['airport_departures'] = airport_departures
+
+    G_weighted = build_weighted_graph(state["G"])
+    btw = compute_betweenness_centrality(G_weighted)
+    state['centrality_table'] = btw
+
+    state['airport_table'] = run_full_reconciliation(
+        state['df'], state["G"], G_weighted=G_weighted, btw=btw, legs_by_tail=legs_by_tail,
+    )
     state['route_table'] = compute_route_delay_summary(state['df'])
 
     lats = {code: data.get('lat') for code, data in state["G"].nodes(data=True)}
@@ -96,13 +118,24 @@ def load_data():
     routes_with_path['path'] = routes_with_path.apply(route_path, axis=1)
     state['route_table'] = routes_with_path.set_index(['Origin', 'Dest'])
 
-    state['tail_summary'] = compute_tail_summary(state['G'])
-    legs_by_tail = {}
-    for u, v, d in state["G"].edges(data=True):
-        legs_by_tail.setdefault(d['tail_number'], []).append((u, v, d))
-    for tail in legs_by_tail:
-        legs_by_tail[tail].sort(key=lambda e: e[2]['crs_dep_dt'])
+    state['tail_summary'] = compute_tail_summary(legs_by_tail)
     state['legs_by_tail'] = legs_by_tail
+
+    state['airport_coords'] = {
+        code: (data['lat'], data['lon'])
+        for code, data in state["G"].nodes(data=True)
+        if data.get('lat') is not None and data.get('lon') is not None
+    }
+    state['route_duration_table'] = _build_route_duration_table(legs_by_tail)
+
+    state['solver_pool'] = ProcessPoolExecutor(max_workers=2, initializer=init_worker)
+    state['solver_semaphore'] = asyncio.Semaphore(2)
+
+
+@app.on_event("shutdown")
+def shutdown_solver_pool():
+    state['solver_pool'].shutdown(wait=False)
+
 
 @app.get("/debug/node-count")
 def node_count():
@@ -117,8 +150,8 @@ def get_airports():
     columns = ['total_departures', 'inheritance_rate', 'betweenness', 'weighted_betweenness', 'is_zero_betweenness', 'is_reliable']
     trimmed = state["airport_table"][columns].reset_index()
 
-    lats = {code: data['lat'] for code, data in state["G"].nodes(data=True)}
-    lons = {code: data['lon'] for code, data in state["G"].nodes(data=True)}
+    lats = {code: coord[0] for code, coord in state['airport_coords'].items()}
+    lons = {code: coord[1] for code, coord in state['airport_coords'].items()}
     trimmed['lat'] = trimmed['Origin'].map(lats)
     trimmed['lon'] = trimmed['Origin'].map(lons)
 
@@ -171,7 +204,7 @@ def get_tail_rotation(tail_number: str, date: str):
     if tail_number not in known_tails:
         raise HTTPException(status_code=404, detail=f"Tail number {tail_number} not found")
 
-    legs = get_tail_chain(state["G"], tail_number, date)
+    legs = [leg for leg in state['legs_by_tail'].get(tail_number, []) if leg[2]['flight_date'] == date]
 
     if not legs:
         return {"legs": [], "message": f"{tail_number} had no flights on {date}"}
@@ -185,7 +218,7 @@ def get_tail_full_history(tail_number: str):
     if tail_number not in known_tails:
         raise HTTPException(status_code=404, detail=f"Tail number {tail_number} not found")
 
-    legs = get_tail_chain(state["G"], tail_number)
+    legs = state['legs_by_tail'].get(tail_number, [])
 
     return {"legs": [shape_leg(u, v, d) for u, v, d in legs]}
 
@@ -201,8 +234,8 @@ ORIGIN_STATUSES = {"not_yet_started", "taxiing_out", "cancelled"}
 def get_state(date: str, time: str):
     query_datetime = pd.to_datetime(f"{date} {time}")
 
-    lats = {code: data['lat'] for code, data in state["G"].nodes(data=True)}
-    lons = {code: data['lon'] for code, data in state["G"].nodes(data=True)}
+    lats = {code: coord[0] for code, coord in state['airport_coords'].items()}
+    lons = {code: coord[1] for code, coord in state['airport_coords'].items()}
 
     results = []
     for t in state["tail_summary"]:
@@ -249,19 +282,32 @@ def get_state(date: str, time: str):
     return {"aircraft": results}
 
 
-class DisruptResponse(BaseModel):
+class RankedCandidate(BaseModel):
     tail_number: str
+    score: float
+    delay: float
+    network_disruption: float
+    connecting_flights_missed: int
+
+class DisruptResponse(BaseModel):
     cancelled_leg: str
+    mode: str
     downstream_legs: List[str]
-    # STUB metric: sum of pre-existing historical arr_delay on downstream legs.
-    # Not a simulated cascade -- identical regardless of whether this leg is
-    # actually cancelled. Real induced-delay propagation via turnaround_to_next
-    # is Day 11 scope, shared with swap-ranking logic.
-    total_cascade_minutes: float
-    swap_candidates: List[str]
-    
+    ranked_candidates: List[RankedCandidate]
+    cancellations_avoided: int
+    total_induced_delay_minutes: Optional[float]
+    baseline_cost_minutes: float
+    improvement_pct: Optional[float]
+    best_candidate: Optional[str]
+
 @app.post("/disrupt", response_model=DisruptResponse)
 def disrupt_flight(request: DisruptRequest):
+    if request.mode not in RANKING_MODES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid mode '{request.mode}'. Valid options: {list(RANKING_MODES.keys())}"
+        )
+
     cancelled_leg, downstream = get_downstream_legs(
         state['legs_by_tail'],
         request.tail_number,
@@ -279,31 +325,122 @@ def disrupt_flight(request: DisruptRequest):
 
     downstream_legs = [f"{u}->{v}" for u, v, d in downstream]
 
-    # STUB: this is NOT a simulated cascade -- it sums pre-existing historical
-    # arr_delay on downstream legs, which is identical whether or not this leg
-    # (or any leg resolving to the same cancelled_index) is actually cancelled.
-    # Real simulation (propagating induced delay through turnaround_to_next)
-
-    total_cascade_minutes = sum(
-        d['arr_delay'] for _, _, d in downstream
-        if d['arr_delay'] is not None and not pd.isna(d['arr_delay']) and d['arr_delay'] > 0
-    )
-
-    swap_candidates = find_swap_candidates(
+    # Candidates must be parked at the cancelled leg's DESTINATION (where the
+    # downstream chain begins), not its origin -- fixes a pre-existing bug
+    # where this call passed request.origin instead.
+    candidates = find_swap_candidates(
         state['legs_by_tail'],
-        request.origin,
+        request.destination,
         request.date,
         request.time,
     )
 
+    ranked = rank_candidates(
+        cancelled_leg, downstream, candidates, request.mode,
+        state['route_table'], state['centrality_table'], state['legs_by_tail'],
+    )
+    improvement = compute_recovery_improvement(
+        cancelled_leg, downstream, candidates, request.mode,
+        state['route_table'], state['centrality_table'], state['legs_by_tail'],
+        ranked=ranked,
+    )
+
+    return {
+        "cancelled_leg": f"{request.origin}->{request.destination}",
+        "mode": request.mode,
+        "downstream_legs": downstream_legs,
+        "ranked_candidates": ranked,
+        "cancellations_avoided": improvement["cancellations_avoided"],
+        "total_induced_delay_minutes": improvement["total_induced_delay_minutes"],
+        "baseline_cost_minutes": improvement["baseline_cost_minutes"],
+        "improvement_pct": improvement["improvement_pct"],
+        "best_candidate": improvement["best_candidate"],
+    }
+
+
+class AircraftDownRequest(BaseModel):
+    tail_number: str
+    date: str
+    time: str
+    mode: str = "all_factors_combined"
+    solver: str = "greedy"  # "greedy" or "optimal"
+
+class RecoverySegment(BaseModel):
+    tail_number: Optional[str]
+    legs_covered: List[Tuple[str, str]]
+    induced_delay_minutes: Optional[float]
+    opportunity_cost: Optional[float]
+    return_trip_minutes: Optional[float]
+    score: Optional[float]
+
+class AircraftDownResponse(BaseModel):
+    tail_number: str
+    mode: str
+    solver: str
+    segments: List[RecoverySegment]
+    total_orphaned_legs: int
+    total_covered_legs: int
+    total_uncovered_legs: int
+    num_segments: int
+    total_induced_delay_minutes: float
+    optimal_timed_out: bool = False
+
+@app.post("/disrupt/aircraft-down", response_model=AircraftDownResponse)
+async def aircraft_down(request: AircraftDownRequest):
+    if request.mode not in RANKING_MODES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid mode '{request.mode}'. Valid options: {list(RANKING_MODES.keys())}"
+        )
+
+    if request.solver not in ("greedy", "optimal"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid solver '{request.solver}'. Valid options: ['greedy', 'optimal']"
+        )
+
+    if request.tail_number not in state['legs_by_tail']:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Unknown tail number '{request.tail_number}': no flight history found for this aircraft"
+        )
+
+    semaphore = state['solver_semaphore']
+    if semaphore.locked():
+        raise HTTPException(
+            status_code=429,
+            detail="Solver is busy with other requests, try again shortly"
+        )
+
+    loop = asyncio.get_running_loop()
+    pool = state['solver_pool']
+    fn = partial(solve_aircraft_down, request.tail_number, request.date, request.time, request.mode, request.solver)
+
+    optimal_timed_out = False
+    async with semaphore:
+        if request.solver == "optimal":
+            try:
+                result = await asyncio.wait_for(loop.run_in_executor(pool, fn), timeout=OPTIMAL_SOLVER_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError:
+                fallback_fn = partial(solve_aircraft_down, request.tail_number, request.date, request.time, request.mode, "greedy")
+                result = await loop.run_in_executor(pool, fallback_fn)
+                optimal_timed_out = True
+        else:
+            result = await loop.run_in_executor(pool, fn)
+
     return {
         "tail_number": request.tail_number,
-        "cancelled_leg": f"{request.origin}->{request.destination}",
-        "downstream_legs": downstream_legs,
-        "total_cascade_minutes": total_cascade_minutes,
-        "swap_candidates": swap_candidates,
+        "mode": request.mode,
+        "solver": "greedy" if optimal_timed_out else request.solver,
+        "optimal_timed_out": optimal_timed_out,
+        "segments": result["segments"],
+        "total_orphaned_legs": result["total_orphaned_legs"],
+        "total_covered_legs": result["total_covered_legs"],
+        "total_uncovered_legs": result["total_uncovered_legs"],
+        "num_segments": result["num_segments"],
+        "total_induced_delay_minutes": result["total_induced_delay_minutes"],
     }
-    
+
 class AirportBasic(BaseModel):
     Origin: str
     lat: float
@@ -316,11 +453,7 @@ class AirportsAllResponse(BaseModel):
 @app.get("/airports/all", response_model=AirportsAllResponse)
 def get_all_airports():
     tail_counts = {t["tail_number"]: t["total_legs"] for t in state["tail_summary"]}
-    
-    # count departures per airport from the graph nodes
-    airport_departures = {}
-    for u, v, d in state["G"].edges(data=True):
-        airport_departures[u] = airport_departures.get(u, 0) + 1
+    airport_departures = state['airport_departures']
 
     result = []
     for code, data in state["G"].nodes(data=True):

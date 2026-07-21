@@ -1,3 +1,23 @@
+import pandas as pd
+
+def build_flight_frame_from_graph(G):
+    """(Origin, Dest, ArrDelay, Cancelled, Diverted, LateAircraftDelay) frame built from
+    edge attributes already on the loaded rotation graph, instead of re-parsing the source
+    CSV -- those attributes were themselves populated from this same CSV in build_graph.py,
+    so this is equivalent data without the redundant disk read.
+    """
+    rows = [
+        {
+            'Origin': u,
+            'Dest': v,
+            'ArrDelay': d['arr_delay'],
+            'Cancelled': d['cancelled'],
+            'Diverted': d['diverted'],
+            'LateAircraftDelay': d['late_aircraft_delay'],
+        }
+        for u, v, d in G.edges(data=True)
+    ]
+    return pd.DataFrame(rows)
 
 def compute_route_delay_summary(df):
     grouped = df.groupby(['Origin', 'Dest']).agg(
@@ -10,12 +30,8 @@ def compute_route_delay_summary(df):
     grouped['cancellation_rate'] = grouped['cancelled_count'] / grouped['total_flights']
     return grouped
 
-def compute_tail_summary(G):
-    tail_counts = {}
-    for u, v, d in G.edges(data=True):
-        tail_counts[d['tail_number']] = tail_counts.get(d['tail_number'], 0) + 1
- 
-    tails = [{"tail_number": tail, "total_legs": count} for tail, count in tail_counts.items()]
+def compute_tail_summary(legs_by_tail):
+    tails = [{"tail_number": tail, "total_legs": len(legs)} for tail, legs in legs_by_tail.items()]
     tails.sort(key=lambda t: t['total_legs'], reverse=True)
     return tails
 
