@@ -1,12 +1,28 @@
 import math
 
+EARTH_RADIUS_NM = 3440.065  # mean Earth radius, nautical miles
+
+
+def _angular_distance_rad(lat1, lon1, lat2, lon2):
+    """Great-circle angular distance (radians) via the spherical law of
+    cosines. Factored out of great_circle_interpolate so
+    great_circle_distance_nm can reuse the exact same formula instead of
+    reimplementing it."""
+    lat1, lon1, lat2, lon2 = map(math.radians, [lat1, lon1, lat2, lon2])
+    return math.acos(min(1, max(-1,
+        math.sin(lat1)*math.sin(lat2) + math.cos(lat1)*math.cos(lat2)*math.cos(lon2-lon1)
+    )))
+
+
+def great_circle_distance_nm(lat1, lon1, lat2, lon2):
+    """Great-circle distance in nautical miles between two (lat, lon) points."""
+    return _angular_distance_rad(lat1, lon1, lat2, lon2) * EARTH_RADIUS_NM
+
 
 def great_circle_interpolate(lat1, lon1, lat2, lon2, frac):
     """Spherical slerp: (lat, lon) at fraction `frac` (0=start, 1=end)."""
+    d = _angular_distance_rad(lat1, lon1, lat2, lon2)
     lat1, lon1, lat2, lon2 = map(math.radians, [lat1, lon1, lat2, lon2])
-    d = math.acos(min(1, max(-1,
-        math.sin(lat1)*math.sin(lat2) + math.cos(lat1)*math.cos(lat2)*math.cos(lon2-lon1)
-    )))
     if d == 0:
         return math.degrees(lat1), math.degrees(lon1)
     a = math.sin((1-frac)*d) / math.sin(d)
@@ -55,5 +71,17 @@ if __name__ == "__main__":
     assert len(path) == 5
     assert math.isclose(path[0][0], atl[0], abs_tol=1e-9) and math.isclose(path[0][1], atl[1], abs_tol=1e-9)
     assert math.isclose(path[-1][0], sea[0], abs_tol=1e-9) and math.isclose(path[-1][1], sea[1], abs_tol=1e-9)
+
+    # --- great_circle_distance_nm ---
+    same_point = great_circle_distance_nm(*atl, *atl)
+    assert math.isclose(same_point, 0.0, abs_tol=1e-3), f"distance to self should be ~0, got {same_point}"
+
+    atl_sea_nm = great_circle_distance_nm(*atl, *sea)
+    sea_atl_nm = great_circle_distance_nm(*sea, *atl)
+    assert math.isclose(atl_sea_nm, sea_atl_nm, rel_tol=1e-9), "distance should be symmetric"
+    # ATL-SEA is a real ~2,180 sm / ~1,895 nm nonstop -- sanity-check the
+    # great-circle number lands in a plausible range for that route.
+    assert 1700 < atl_sea_nm < 2100, f"ATL-SEA great-circle distance out of plausible range: {atl_sea_nm} nm"
+    print(f"ATL-SEA great-circle distance: {atl_sea_nm:.1f} nm (symmetric: {sea_atl_nm:.1f} nm)")
 
     print("All geo.py sanity checks passed.")
