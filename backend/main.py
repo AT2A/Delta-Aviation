@@ -3,14 +3,14 @@ from pathlib import Path
 import pickle
 import pandas as pd
 import asyncio
-from concurrent.futures import ProcessPoolExecutor
 from functools import partial
 from analysis.pipeline import run_full_reconciliation
 from analysis.queries import compute_route_delay_summary, compute_tail_summary, get_aircraft_state, build_flight_frame_from_graph
-from analysis.disruption import get_downstream_legs, find_swap_candidates, rank_candidates, compute_recovery_improvement, RANKING_MODES, _build_route_duration_table
+from analysis.disruption import get_downstream_legs, find_swap_candidates, rank_candidates, compute_recovery_improvement, RANKING_MODES, _build_route_duration_table, _build_departure_index
 from analysis.centrality import build_weighted_graph, compute_betweenness_centrality
 from analysis.geo import great_circle_interpolate, great_circle_path
 from backend.solver_worker import solve as solve_aircraft_down, init_worker
+from backend.worker_pool import KillableWorkerPool
 from pydantic import BaseModel
 from typing import List, Optional, Tuple
 from enum import Enum
@@ -18,6 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 DATA_DIR = Path(__file__).parent.parent / "data"
 OPTIMAL_SOLVER_TIMEOUT_SECONDS = 20
+NUM_SOLVER_WORKERS = 2   # single source of truth for both pool size and the concurrency cap below
 
 app = FastAPI()
 
@@ -30,6 +31,11 @@ app.add_middleware(
 
 state = {}
 
+def _parse_state(city):
+    if not city or "," not in city:
+        return None
+    return city.rsplit(",", 1)[-1].strip()
+
 class Airport(BaseModel):
     Origin: str
     total_departures: int
@@ -40,6 +46,8 @@ class Airport(BaseModel):
     is_reliable: bool
     lat: float
     lon: float
+    city: Optional[str] = None
+    state: Optional[str] = None
 class Route(BaseModel):
     Origin: str
     Dest: str
@@ -70,6 +78,15 @@ class AircraftState(BaseModel):
     destination: Optional[str] = None
     lat: Optional[float] = None
     lon: Optional[float] = None
+    # Present only for in_flight aircraft with valid timing -- lets the
+    # frontend keep interpolating this aircraft's position smoothly between
+    # /state polls instead of only ever seeing it at the exact query time.
+    wheels_off: Optional[str] = None
+    wheels_on: Optional[str] = None
+    origin_lat: Optional[float] = None
+    origin_lon: Optional[float] = None
+    dest_lat: Optional[float] = None
+    dest_lon: Optional[float] = None
 class DisruptRequest(BaseModel):
     tail_number: str
     date: str
@@ -81,10 +98,17 @@ class DisruptRequest(BaseModel):
 @app.on_event("startup")
 def load_data():
     with open(DATA_DIR / "delta_rotation_graph.pkl", "rb") as f:
-        state["G"] = pickle.load(f)
+        graph_bytes = f.read()
+    state["G"] = pickle.loads(graph_bytes)
+    state["airport_city"] = {code: data.get("city") for code, data in state["G"].nodes(data=True)}
     state["df"] = build_flight_frame_from_graph(state["G"])
     print("Graph loaded:", state["G"].number_of_nodes(), "nodes")
     print("Flight frame built from graph:", len(state["df"]), "rows")
+
+    df = state["df"]
+    delayed_minutes = df["ArrDelay"].fillna(0).clip(lower=0).sum()
+    inherited_minutes = df["LateAircraftDelay"].fillna(0).sum()
+    state["network_inherited_delay_pct"] = round(inherited_minutes / delayed_minutes * 100, 1) if delayed_minutes > 0 else 0.0
 
     legs_by_tail = {}
     airport_departures = {}
@@ -102,6 +126,17 @@ def load_data():
     state['airport_table'] = run_full_reconciliation(
         state['df'], state["G"], G_weighted=G_weighted, btw=btw, legs_by_tail=legs_by_tail,
     )
+
+    cascade_counts = state['airport_table']['cascade_count'].fillna(0)
+    state['network_total_cascades'] = int(cascade_counts.sum())
+    if cascade_counts.sum() > 0:
+        state['network_avg_cascade_depth'] = round(
+            (state['airport_table']['avg_cascade_depth'].fillna(0) * cascade_counts).sum() / cascade_counts.sum(), 2
+        )
+    else:
+        state['network_avg_cascade_depth'] = 0.0
+    state['network_max_cascade_depth'] = int(state['airport_table']['max_cascade_depth'].fillna(0).max())
+
     state['route_table'] = compute_route_delay_summary(state['df'])
 
     lats = {code: data.get('lat') for code, data in state["G"].nodes(data=True)}
@@ -127,14 +162,16 @@ def load_data():
         if data.get('lat') is not None and data.get('lon') is not None
     }
     state['route_duration_table'] = _build_route_duration_table(legs_by_tail)
+    state['departure_index'] = _build_departure_index(legs_by_tail)
 
-    state['solver_pool'] = ProcessPoolExecutor(max_workers=2, initializer=init_worker)
-    state['solver_semaphore'] = asyncio.Semaphore(2)
+    state['solver_pool'] = KillableWorkerPool(num_workers=NUM_SOLVER_WORKERS, initializer=init_worker)
+    state['solver_pool'].start()
+    state['solver_semaphore'] = asyncio.Semaphore(NUM_SOLVER_WORKERS)
 
 
 @app.on_event("shutdown")
 def shutdown_solver_pool():
-    state['solver_pool'].shutdown(wait=False)
+    state['solver_pool'].shutdown()
 
 
 @app.get("/debug/node-count")
@@ -144,6 +181,10 @@ def node_count():
 
 class AirportsResponse(BaseModel):
     airports: List[Airport]
+    network_inherited_delay_pct: float
+    network_total_cascades: int
+    network_avg_cascade_depth: float
+    network_max_cascade_depth: int
 
 @app.get("/airports", response_model=AirportsResponse)
 def get_airports():
@@ -154,8 +195,16 @@ def get_airports():
     lons = {code: coord[1] for code, coord in state['airport_coords'].items()}
     trimmed['lat'] = trimmed['Origin'].map(lats)
     trimmed['lon'] = trimmed['Origin'].map(lons)
+    trimmed['city'] = trimmed['Origin'].map(state['airport_city'])
+    trimmed['state'] = trimmed['city'].map(_parse_state)
 
-    return {"airports": trimmed.to_dict(orient='records')}
+    return {
+        "airports": trimmed.to_dict(orient='records'),
+        "network_inherited_delay_pct": state["network_inherited_delay_pct"],
+        "network_total_cascades": state["network_total_cascades"],
+        "network_avg_cascade_depth": state["network_avg_cascade_depth"],
+        "network_max_cascade_depth": state["network_max_cascade_depth"],
+    }
 
 
 class RoutesResponse(BaseModel):
@@ -248,6 +297,8 @@ def get_state(date: str, time: str):
         dest_lat, dest_lon = lats.get(aircraft_state['destination']), lons.get(aircraft_state['destination'])
 
         lat = lon = None
+        wheels_off_iso = wheels_on_iso = None
+        interp_origin_lat = interp_origin_lon = interp_dest_lat = interp_dest_lon = None
         if aircraft_state['status'] == 'in_flight':
             wheels_off = aircraft_state['wheels_off']
             wheels_on = aircraft_state['wheels_on']
@@ -258,6 +309,13 @@ def get_state(date: str, time: str):
                 frac = (query_datetime - wheels_off) / (wheels_on - wheels_off)
                 frac = max(0.0, min(1.0, float(frac)))
                 lat, lon = great_circle_interpolate(origin_lat, origin_lon, dest_lat, dest_lon, frac)
+                # Same inputs used above -- expose them so the frontend can
+                # redo this interpolation itself for any time in between,
+                # instead of needing a fresh /state poll for every frame.
+                wheels_off_iso = wheels_off.isoformat()
+                wheels_on_iso = wheels_on.isoformat()
+                interp_origin_lat, interp_origin_lon = origin_lat, origin_lon
+                interp_dest_lat, interp_dest_lon = dest_lat, dest_lon
             else:
                 # missing timing/coords -- fall back to destination
                 lat, lon = dest_lat, dest_lon
@@ -277,6 +335,12 @@ def get_state(date: str, time: str):
             "destination": aircraft_state['destination'],
             "lat": lat,
             "lon": lon,
+            "wheels_off": wheels_off_iso,
+            "wheels_on": wheels_on_iso,
+            "origin_lat": interp_origin_lat,
+            "origin_lon": interp_origin_lon,
+            "dest_lat": interp_dest_lat,
+            "dest_lon": interp_dest_lon,
         })
 
     return {"aircraft": results}
@@ -338,6 +402,7 @@ def disrupt_flight(request: DisruptRequest):
     ranked = rank_candidates(
         cancelled_leg, downstream, candidates, request.mode,
         state['route_table'], state['centrality_table'], state['legs_by_tail'],
+        departure_index=state['departure_index'],
     )
     improvement = compute_recovery_improvement(
         cancelled_leg, downstream, candidates, request.mode,
@@ -412,7 +477,6 @@ async def aircraft_down(request: AircraftDownRequest):
             detail="Solver is busy with other requests, try again shortly"
         )
 
-    loop = asyncio.get_running_loop()
     pool = state['solver_pool']
     fn = partial(solve_aircraft_down, request.tail_number, request.date, request.time, request.mode, request.solver)
 
@@ -420,13 +484,13 @@ async def aircraft_down(request: AircraftDownRequest):
     async with semaphore:
         if request.solver == "optimal":
             try:
-                result = await asyncio.wait_for(loop.run_in_executor(pool, fn), timeout=OPTIMAL_SOLVER_TIMEOUT_SECONDS)
+                result = await pool.submit(fn, timeout=OPTIMAL_SOLVER_TIMEOUT_SECONDS)
             except asyncio.TimeoutError:
                 fallback_fn = partial(solve_aircraft_down, request.tail_number, request.date, request.time, request.mode, "greedy")
-                result = await loop.run_in_executor(pool, fallback_fn)
+                result = await pool.submit(fallback_fn)
                 optimal_timed_out = True
         else:
-            result = await loop.run_in_executor(pool, fn)
+            result = await pool.submit(fn)
 
     return {
         "tail_number": request.tail_number,
