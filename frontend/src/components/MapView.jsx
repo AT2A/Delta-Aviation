@@ -1,13 +1,35 @@
 import DeckGL from "@deck.gl/react"
 import { Map } from "react-map-gl/maplibre"
-import { ScatterplotLayer, PathLayer } from "@deck.gl/layers"
+import { ScatterplotLayer, PathLayer, TextLayer } from "@deck.gl/layers"
 import { useState, useEffect, useMemo } from "react"
 import "maplibre-gl/dist/maplibre-gl.css"
+import { useTheme } from "../ThemeContext"
 
 const INITIAL_VIEW = {
   longitude: -98.5,
   latitude: 39.5,
   zoom: 4,
+}
+
+// Volume-based visual weight for the "routes" layer -- suppresses the long
+// tail of minor routes so major hub routes aren't lost in the haze.
+const ROUTE_WIDTH_PX = [0.5, 5]
+const ROUTE_OPACITY = [20, 200]
+const lerp = ([lo, hi], t) => lo + t * (hi - lo)
+
+function hexToRgb(hex) {
+  const n = Number.parseInt(hex.replace("#", ""), 16)
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255]
+}
+
+function scoreRoutes(routes) {
+  const counts = routes.map(r => r.flight_count ?? 0)
+  const min = Math.min(...counts)
+  const max = Math.max(...counts)
+  const span = max - min || 1
+  return routes
+    .map(r => ({ ...r, score: Math.pow(Math.max((r.flight_count ?? 0) - min, 0) / span, 1.2) }))
+    .sort((a, b) => a.score - b.score) // hubs drawn last/on top
 }
 
 // aircraft status -> dot color
@@ -22,9 +44,11 @@ const STATUS_COLOR = {
 }
 
 // aircraft (optional): [{ tail_number, lat, lon, status }]
-function MapView({ aircraft, onAircraftClick }) {
+function MapView({ aircraft, onAircraftClick, height = "100vh", selectedAirport = null }) {
+  const { theme } = useTheme()
   const [airports, setAirports] = useState([])
   const [routes, setRoutes] = useState([])
+  const [routeLimit, setRouteLimit] = useState(null) // null = no cap (show all)
 
   useEffect(() => {
     fetch("/airports/all")
@@ -33,24 +57,32 @@ function MapView({ aircraft, onAircraftClick }) {
 
     fetch("/routes")
       .then(res => res.json())
-      .then(data => setRoutes(data.routes.map(r => ({
+      .then(data => setRoutes(scoreRoutes(data.routes.map(r => ({
         ...r,
         // Flip [lat, lon] -> [lon, lat] once here instead of per-render
         // inside getPath (which deck.gl would otherwise re-run on every
         // route on every re-render, including ones where routes hasn't
         // actually changed).
         path: r.path ? r.path.map(([lat, lon]) => [lon, lat]) : r.path,
-      }))))
+      })))))
   }, [])
 
   const layers = useMemo(() => {
+    const scopedRoutes = selectedAirport
+      ? routes.filter(r => r.Origin === selectedAirport || r.Dest === selectedAirport)
+      : routes
+    const visibleRoutes = routeLimit != null ? scopedRoutes.slice(-routeLimit) : scopedRoutes
+
     const result = [
       new PathLayer({
         id: "routes",
-        data: routes.filter(d => d.path && d.path.length > 0),
+        data: visibleRoutes.filter(d => d.path && d.path.length > 0),
         getPath: d => d.path,
-        getWidth: d => Math.sqrt(d.flight_count) * 0.1,
-        getColor: d => d.avg_delay > 15 ? [255, 80, 80, 160] : [80, 140, 255, 120],
+        getWidth: d => lerp(ROUTE_WIDTH_PX, d.score),
+        getColor: d => {
+          const [r, g, b] = d.avg_delay > 15 ? [255, 80, 80] : [80, 140, 255]
+          return [r, g, b, lerp(ROUTE_OPACITY, d.score)]
+        },
         widthUnits: "pixels",
         pickable: true,
       }),
@@ -59,12 +91,33 @@ function MapView({ aircraft, onAircraftClick }) {
         id: "airports",
         data: airports,
         getPosition: d => [d.lon, d.lat],
-        getRadius: d => Math.sqrt(d.total_legs) * 50,
-        getFillColor: d => d.inheritance_rate > 0.12
-          ? [255, 100, 100]
-          : [100, 200, 255],
+        getRadius: d => Math.sqrt(d.total_legs) * 50 * (d.Origin === selectedAirport ? 1.8 : 1),
+        getFillColor: d => {
+          const base = d.inheritance_rate > 0.12 ? [255, 100, 100] : [100, 200, 255]
+          if (!selectedAirport) return [...base, 255]
+          return d.Origin === selectedAirport ? [255, 210, 60, 255] : [...base, 60]
+        },
         radiusUnits: "meters",
         pickable: true,
+        updateTriggers: {
+          getFillColor: [selectedAirport],
+          getRadius: [selectedAirport],
+        },
+      }),
+      new TextLayer({
+        id: "airport-labels",
+        data: airports,
+        getPosition: d => [d.lon, d.lat],
+        getText: d => d.Origin,
+        getSize: 11,
+        sizeUnits: "pixels",
+        getColor: hexToRgb(theme.textPrimary),
+        getPixelOffset: [0, -12],
+        fontFamily: "'JetBrains Mono', monospace",
+        fontWeight: 600,
+        background: true,
+        getBackgroundColor: [...hexToRgb(theme.cardBg), 200],
+        backgroundPadding: [3, 1],
       }),
     ]
 
@@ -95,10 +148,10 @@ function MapView({ aircraft, onAircraftClick }) {
     }
 
     return result
-  }, [routes, airports, aircraft, onAircraftClick])
+  }, [routes, airports, aircraft, onAircraftClick, routeLimit, theme, selectedAirport])
 
   return (
-    <div style={{ width: "100%", height: "100vh" }}>
+    <div style={{ width: "100%", height, position: "relative" }}>
       <DeckGL
         initialViewState={INITIAL_VIEW}
         controller={true}
@@ -106,9 +159,32 @@ function MapView({ aircraft, onAircraftClick }) {
         style={{ position: "relative", width: "100%", height: "100%" }}
       >
         <Map
-          mapStyle="https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json"
+          mapStyle={theme.mapStyleUrl}
+          attributionControl={{ compact: true }}
         />
       </DeckGL>
+      {routes.length > 0 && (
+        <div style={{
+          position: "absolute", top: "12px", left: "12px", zIndex: 1,
+          display: "flex", alignItems: "center", gap: "8px",
+          background: theme.cardBg, border: `1px solid ${theme.border}`,
+          borderRadius: "8px", padding: "6px 10px", minWidth: "180px",
+          fontFamily: "'Inter', system-ui, sans-serif",
+        }}>
+          <span style={{ fontSize: "11px", fontWeight: 600, color: theme.textSecondary, whiteSpace: "nowrap" }}>
+            Top {routeLimit ?? routes.length} of {routes.length}
+          </span>
+          <input
+            type="range"
+            min={Math.min(10, routes.length)}
+            max={routes.length}
+            step={1}
+            value={routeLimit ?? routes.length}
+            onChange={e => setRouteLimit(Number(e.target.value))}
+            style={{ flex: 1, accentColor: theme.accentColor, height: "4px", cursor: "pointer" }}
+          />
+        </div>
+      )}
     </div>
   )
 }
