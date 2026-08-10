@@ -37,7 +37,7 @@ function makeFlClusterLabel(fill) {
 // exposed by any live endpoint (the underlying scripts are one-off diagnostics,
 // not wired into the backend), so these are stated as labeled historical
 // findings rather than presented as live-computed.
-const FINDINGS_DATE = "2026-08-01"
+const FINDINGS_DATE = "2026-08-08"
 
 function CustomTooltip({ active, payload, theme }) {
   if (!active || !payload || !payload.length) return null
@@ -229,15 +229,16 @@ function Analysis() {
           )}
 
           <div style={{ fontSize: "12.5px", color: theme.textSecondary, lineHeight: 1.6, marginTop: "12px", maxWidth: "820px" }}>
-            <strong style={{ color: theme.textPrimary }}>ATL</strong> sits at
-            {atlCentrality != null ? ` ~${(atlCentrality * 100).toFixed(0)}% betweenness centrality` : " very high betweenness centrality"} —
-            structurally the most critical node in the network — yet its inheritance rate
-            is only low-to-mid relative to that centrality: it is well-buffered against
-            becoming a delay relay. The <strong style={{ color: theme.textPrimary }}>Florida/leisure cluster</strong> (PBI,
-            FLL, MIA, TPA, MCO) shows the opposite pattern: near-zero structural centrality
-            but disproportionately high inheritance rates. High centrality does not imply
-            high realized cascade risk, and vice versa — structural position and cascade
-            vulnerability are measuring different things.
+            <strong style={{ color: theme.textPrimary }}>ATL</strong> (Atlanta Airport) has
+            {atlCentrality != null ? ` approximately ${(atlCentrality * 100).toFixed(0)}% betweenness centrality` : " very high betweenness centrality"},
+            the most structurally critical airport in the network, which reflects Delta
+            adopting it as their main hub. Its inheritance rate is only low-to-mid for a
+            node that size, which means it's well buffered. The <strong style={{ color: theme.textPrimary }}>Florida/leisure cluster</strong> (PBI,
+            FLL, MIA, TPA, MCO) is the opposite: near-zero centrality, some of the highest
+            inheritance rates in the network.
+            <br /><br />
+            Centrality measures structural position and the inheritance rate measures the
+            realized cascade delay risk.
             <br /><br />
             <span style={{ color: theme.textMuted, fontSize: "11.5px" }}>
               {zeroBtwCount} of {airports.length} airports register exactly zero centrality
@@ -295,11 +296,10 @@ function Analysis() {
             <div style={{ ...eyebrowStyle, color: flColor }}>Florida / Leisure Paradox</div>
             <div style={{ fontSize: "12.5px", color: theme.textSecondary, lineHeight: 1.6 }}>
               PBI, FLL, MIA, TPA and MCO carry heavy traffic but sit near the bottom of
-              the network's structural centrality ranking. Because they're rarely a
-              through-path for other routes, that traffic doesn't register as "important"
-              structurally — yet these airports relay a disproportionate share of
-              inherited delay. High traffic, structurally peripheral, outsized cascade
-              contribution.
+              the network's structural centrality ranking. This is because they're rarely
+              a through-path for other routes; that traffic does not register as "important"
+              structurally. Yet these airports relay a disproportionate share of the
+              inherited delay.
             </div>
           </div>
         </div>
@@ -326,12 +326,13 @@ function Analysis() {
           <div style={{ display: "flex", gap: "20px" }}>
             <div style={{ ...cardStyle, flex: 1, padding: "16px 20px" }}>
               <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: "24px", fontWeight: 700, color: theme.successNumber, marginBottom: "6px" }}>
-                97%
+                98%
               </div>
               <div style={{ fontSize: "12px", color: theme.textSecondary, lineHeight: 1.55 }}>
-                Of sampled single-leg cancellations where any recovery candidate existed
-                at all, 97% (74 of 76) were fully absorbed with zero induced delay
-                &mdash; 100 scenarios sampled, stratified by hub tier and time of day.
+                Of sampled single-leg cancellations, 98% resolved cleanly &mdash; fully
+                absorbed with zero induced delay, or requiring no recovery at all &mdash;
+                while only 2% showed a genuine, partial-delay tradeoff. 100 scenarios
+                sampled, stratified by hub tier and time of day.
               </div>
             </div>
 
@@ -340,10 +341,10 @@ function Analysis() {
                 Supply &gt; Coordination
               </div>
               <div style={{ fontSize: "12px", color: theme.textSecondary, lineHeight: 1.55 }}>
-                In mass-disruption stress tests, candidate scarcity &mdash; not allocation
-                inefficiency &mdash; is the dominant constraint. When many flights from one
-                airport are cancelled at once, the limiting factor is usually too few
-                available aircraft, not poor assignment logic.
+                In mass-disruption stress tests, candidate scarcity is the dominant
+                constraint, not allocation inefficiency. When many flights from one
+                airport cancel at once, the limiter is usually too few available
+                aircraft on the ground, not a bad assignment problem.
               </div>
             </div>
 
