@@ -15,29 +15,15 @@ _worker_state = {}
 
 
 def init_worker():
-    """ProcessPoolExecutor initializer -- runs once per worker process.
+    """Worker-process initializer. Windows' 'spawn' start method shares no
+    memory with the main process, so each worker rebuilds its own tables.
 
-    Windows uses the 'spawn' start method (no fork, no shared memory with
-    the main process), so each worker independently rebuilds the tables the
-    solver functions need.
-
-    Measured directly (not assumed) that passing legs_by_tail through
-    ProcessPoolExecutor's initargs instead is NOT faster: it's a ~449MB
-    structure of ~1.27M small per-leg dicts, and pickling/unpickling that
-    many individual Python objects (~50s round trip, measured) costs more
-    than just reloading the graph pickle here and rebuilding it locally --
-    so this rebuilds in-process rather than receiving it via initargs. What
-    IS a real, measured win: building the (Origin, Dest, ArrDelay,
-    Cancelled, Diverted, LateAircraftDelay) frame from already-loaded graph
-    edge attributes (build_flight_frame_from_graph, ~2s) instead of
-    re-parsing the 1.27M-row CSV from disk (~13.6s) -- that data is
-    redundant with what's already on the graph, see analysis/queries.py.
-
-    The graph pickle itself is read into memory first and deserialized via
-    pickle.loads() rather than pickle.load(file) -- measured ~2.5-3x faster
-    on this machine (file-object deserialization drives many small reads
-    against disk; reading the bytes up front and deserializing in-memory
-    doesn't).
+    Rebuilds legs_by_tail locally from the graph pickle rather than passing
+    it through initargs -- pickling its ~1.27M per-leg dicts (~50s measured)
+    costs more than reloading the graph here. Builds the flight frame from
+    already-loaded graph edges (~2s) instead of re-parsing the CSV (~13.6s).
+    Reads the pickle bytes up front and calls pickle.loads() rather than
+    pickle.load(file) -- ~2.5-3x faster, measured.
     """
     with open(DATA_DIR / "delta_rotation_graph.pkl", "rb") as f:
         graph_bytes = f.read()

@@ -3,33 +3,18 @@ from bisect import bisect_left, bisect_right
 from analysis.queries import get_aircraft_state, find_owning_leg
 from analysis.geo import great_circle_distance_nm
 
-# Deliberate callback to the Phase 2 "Florida/leisure airport paradox" finding:
-# structural position (centrality) matters more for network-wide delay
-# propagation than raw traffic volume, so it gets the larger weight here.
+# Centrality weighted higher than traffic: structural position drives
+# network-wide delay propagation more than raw volume (Phase 2 finding).
 CENTRALITY_WEIGHT = 0.6
 TRAFFIC_WEIGHT = 0.4
 
 
 def importance_weight(origin, destination, route_table, centrality_table, max_flight_count=None, max_betweenness=None):
-    """
-    Proxy for how "important" a route is, combining route traffic volume
-    and airport structural centrality. Used by replacement_score for both
-    importance_weight_of_cancelled_leg and importance_weight_of_candidates_
-    own_legs -- same function, different callers.
+    """Proxy for route "importance": combines traffic volume and structural
+    centrality. Pass max_flight_count/max_betweenness when calling this
+    per-candidate to avoid rescanning route_table/centrality_table each time.
 
-    Deliberately weights centrality higher than traffic as a callback to
-    the Phase 2 finding that structural position matters more than raw
-    traffic for network-wide delay propagation. A stated modeling choice,
-    not a derived/validated ratio.
-
-    max_flight_count/max_betweenness are optional: pass them in when calling
-    this repeatedly (e.g. once per candidate in replacement_score) so the
-    full column/dict scan to find each max only happens once per request,
-    not on every call. Left as normal parameters rather than a cache
-    decorator to match this module's existing explicit-inputs style
-    (simulate_recovery, find_swap_candidates).
-
-    Returns: float, roughly comparable in scale to delay-minutes figures.
+    Returns a float roughly comparable in scale to delay-minutes figures.
     """
     try:
         flight_count = route_table.loc[(origin, destination), 'flight_count']
@@ -50,8 +35,7 @@ def importance_weight(origin, destination, route_table, centrality_table, max_fl
 
     combined = CENTRALITY_WEIGHT * normalized_centrality + TRAFFIC_WEIGHT * normalized_traffic
 
-    # Scale 0-1 result by 100 as a modeling choice, to roughly match the
-    # magnitude of induced_delay_minutes used elsewhere in this module.
+    # Scaled to roughly match induced_delay_minutes' magnitude.
     return combined * 100
 
 
@@ -74,32 +58,17 @@ def get_downstream_legs(legs_by_tail, tail_number, date, origin, destination):
 
 
 def find_swap_candidates(legs_by_tail, origin, date, query_time):
-    """Stage A: which tails are physically able to cover the cancelled leg.
+    """Stage A: which tails can physically cover the cancelled leg (location,
+    status, flew-today) -- a feasibility filter, not a quality ranking (see
+    rank_candidates). Ferry-flight candidates (parked elsewhere) are excluded
+    as a separate future feature.
 
-    Checks three things, all possibility questions (not cost tradeoffs):
-    location (parked at `origin`), status (not mid-flight), and whether the
-    tail flew at all today. Whether a candidate is a *good* choice (tight
-    next-leg gap, opportunity cost, etc.) is Day 11's scoring stage, not this
-    one. Ferry-flight candidates (aircraft parked elsewhere, within ferry
-    range) are a separate future feature and intentionally excluded here.
+    The "flew today" check works around classify_aircraft_status reading a
+    NaT arrival (diverted, or a data gap with Cancelled == 0) as 'parked' --
+    BTS data has no direct flag for long-grounded aircraft, so a tail with no
+    completed leg today is excluded outright as a proxy.
 
-    The "flew today" check exists because classify_aircraft_status's notion
-    of 'parked' is leaky: arr_dt/wheels_off/wheels_on are pd.NaT (not None)
-    when missing, so `if arr is None` never catches a NaT arrival, and a leg
-    that departed but never got a real arrival recorded (diverted, or a data
-    gap, with Cancelled == 0) falls through every NaT comparison and reads as
-    'parked' -- even though the tail's status that day is actually unknown.
-    BTS data can't directly flag long-grounded aircraft (maintenance,
-    storage, out of rotation), so "flew at least once today" is used as a
-    proxy Stage A filter: a tail with zero legs that have both a real dep_dt
-    and a real arr_dt on this date is excluded outright, regardless of what
-    status it would otherwise read as. A tail that flew a real leg earlier
-    today and is now between legs is untouched by this -- it has a completed
-    leg, which is exactly the common case this function already handles
-    correctly.
-
-    Returns every viable candidate, unranked and uncapped -- callers that want
-    a top-N should slice after scoring, not before.
+    Returns every viable candidate, unranked and uncapped.
     """
     query_dt = pd.to_datetime(f"{date} {query_time}")
     candidates = []
@@ -132,13 +101,9 @@ def find_swap_candidates(legs_by_tail, origin, date, query_time):
 
 
 def _day_filtered_legs_by_tail(legs_by_tail, date):
-    """Precompute {tail: day_legs} once per solve call, for callers that
-    invoke find_swap_candidates repeatedly (once per orphaned-leg position)
-    with the same `date` every time. find_swap_candidates itself is left
-    untouched -- its own `day = [leg for leg in legs if leg[2]['flight_date']
-    == date]` filter is idempotent, so handing it an already-day-filtered
-    per-tail list just makes that re-filter a cheap no-op over a handful of
-    legs instead of a full scan of the tail's entire history.
+    """Precompute {tail: day_legs} once, for callers that invoke
+    find_swap_candidates repeatedly with the same `date` -- avoids re-scanning
+    each tail's full history on every call.
     """
     result = {}
     for tail, legs in legs_by_tail.items():
@@ -148,24 +113,19 @@ def _day_filtered_legs_by_tail(legs_by_tail, date):
     return result
 
 
-# Feature 2 (whole-aircraft-down) return-trip repositioning estimate --
-# stated modeling constants, not derived/fitted from data.
+# Return-trip repositioning estimate constants -- stated modeling values,
+# not derived/fitted from data.
 CRUISE_SPEED_KTS = 450.0  # rough commercial jet cruise speed
-TURNAROUND_BUFFER_MINUTES = 45.0  # rough ground/turnaround buffer on top of a ferry flight
+TURNAROUND_BUFFER_MINUTES = 45.0  # ground/turnaround buffer on top of a ferry flight
 
-# Fallback when a ferry estimate can't even be computed geographically
-# (airport missing lat/lon in the source graph) -- a stated conservative
-# estimate, not derived from data. Rare: only an airport the frontend map
-# also couldn't plot would hit this.
+# Fallback when an airport is missing lat/lon in the source graph. Rare.
 MISSING_COORDS_FALLBACK_MINUTES = 180.0
 
 
 def _build_departure_index(legs_by_tail):
-    """{(airport, date): sorted list of crs_dep_dt} for every scheduled
-    departure, built once from legs_by_tail. Lets connecting_flights_missed
-    answer "how many departures from this airport on this date fall in this
-    time window" via a bisect lookup instead of a full linear scan over
-    every tail's every leg on every call.
+    """{(airport, date): sorted list of crs_dep_dt}, built once. Lets
+    connecting_flights_missed use a bisect lookup instead of scanning every
+    tail's every leg on each call.
     """
     by_airport_date = {}
     for legs in legs_by_tail.values():
@@ -177,11 +137,9 @@ def _build_departure_index(legs_by_tail):
 
 def _build_route_duration_table(legs_by_tail):
     """Average real scheduled flight duration (minutes) per (origin,
-    destination) route, built once from legs_by_tail. route_table
-    (analysis/queries.py's compute_route_delay_summary) carries delay/
-    traffic/cancellation stats but no duration, and other callers already
-    depend on that schema unchanged -- so this is a separate small lookup
-    rather than an extension to that shared table.
+    destination) route, built once. Kept separate from route_table
+    (analysis/queries.py) since that schema has no duration column and
+    other callers depend on it unchanged.
     """
     totals, counts = {}, {}
     for legs in legs_by_tail.values():
@@ -197,19 +155,13 @@ def _build_route_duration_table(legs_by_tail):
 
 
 def return_trip_estimate(from_airport, to_airport, route_duration_table, airport_coords):
-    """
-    Estimated time (minutes) for a substitute aircraft to reposition from
-    from_airport back to to_airport. Feeds into opportunity_cost as a single
-    number -- explicitly NOT a tracked/simulated leg with its own downstream
-    propagation; giving it a candidate search of its own would slide into
-    recursive-cascade territory this project has deliberately deferred.
+    """Estimated minutes for a substitute aircraft to reposition back to
+    to_airport. Feeds opportunity_cost as a single number, not a tracked leg
+    with its own propagation (deliberately not simulating recursive cascades).
 
-    Tier 1: if a real scheduled route exists between these two airports
-    (found in route_duration_table, built from real crs_dep_dt/crs_arr_dt
-    data via _build_route_duration_table), use its average real duration.
-    Tier 2: otherwise, a ferry-style estimate -- great-circle distance
-    (analysis/geo.py, not reimplemented here) at an assumed CRUISE_SPEED_KTS,
-    plus a flat TURNAROUND_BUFFER_MINUTES.
+    Tier 1: real scheduled route -> its average duration (route_duration_table).
+    Tier 2: no real route -> great-circle distance (analysis/geo.py) at
+    CRUISE_SPEED_KTS plus TURNAROUND_BUFFER_MINUTES.
     """
     if from_airport == to_airport:
         return 0.0
@@ -230,13 +182,11 @@ def return_trip_estimate(from_airport, to_airport, route_duration_table, airport
 def simulate_recovery(downstream_legs, substitute_available_at):
     """Propagate induced delay forward through a chain of downstream legs.
 
-    Generic chain-propagation utility -- callers decide whose chain and whose
-    availability time to feed in. Called with an orphaned leg's downstream
-    chain to get induced_delay_minutes, or a candidate's own_remaining_legs
-    (seeded with that same candidate's available_at) to get opportunity_cost.
-    Runs entirely off scheduled (crs_dep_dt/crs_arr_dt) times -- this is a
-    hypothetical "what if we cancel now," not a reconciliation against
-    historical actual/inherited delay.
+    Generic: callers decide whose chain and whose availability time to feed
+    in -- an orphaned leg's downstream chain for induced_delay_minutes, or a
+    candidate's own_remaining_legs for opportunity_cost. Runs off scheduled
+    (crs_dep_dt/crs_arr_dt) times -- a hypothetical, not a reconciliation
+    against historical actual delay.
     """
     if not downstream_legs:
         return 0.0, []
@@ -258,7 +208,7 @@ def simulate_recovery(downstream_legs, substitute_available_at):
         else:
             buffer = prev_turnaround
             if buffer is None or pd.isna(buffer):
-                buffer = 0.0  # missing/NaT buffer -- treat as zero, so upstream delay fully carries forward
+                buffer = 0.0  # missing buffer -- full delay carries forward
             induced_delay = max(0.0, prev_induced_delay - buffer)
 
         actual_departure = crs_dep + pd.Timedelta(minutes=induced_delay)
@@ -280,20 +230,14 @@ def simulate_recovery(downstream_legs, substitute_available_at):
 
 
 def compute_candidate_components(cancelled_leg, downstream_legs, candidate, route_table, centrality_table, max_flight_count, max_betweenness, route_duration_table, airport_coords):
-    """
-    The four raw cost/benefit components for one swap candidate, computed
-    once regardless of ranking mode. replacement_score only changes how
-    these are weighted -- it never recomputes them.
+    """The four raw cost/benefit components for one swap candidate, computed
+    once regardless of ranking mode -- replacement_score only reweights them.
 
-    CORRECTED (found during Feature 2 validation): opportunity_cost used to
-    seed the candidate's own-schedule simulation directly from available_at,
-    implicitly assuming the candidate could fly downstream_legs AND resume
-    its own remaining legs starting from the same instant -- it never
-    charged the candidate for the time actually spent flying the substitute
-    chain, or the time needed to get back to wherever its own next leg
-    departs from. Now return-trip-aware, mirroring compute_segment_cost's
-    already-correct pattern (same return_trip_estimate call, same seeding
-    logic) rather than a second, inconsistent version of the same idea.
+    opportunity_cost is return-trip-aware: it charges the candidate for the
+    time spent flying the substitute chain plus repositioning back to its own
+    next leg, rather than assuming it can resume its own schedule instantly
+    from available_at (a bug found and fixed during Feature 2 validation).
+    Mirrors compute_segment_cost's seeding logic.
     """
     induced_delay_minutes, downstream_breakdown = simulate_recovery(downstream_legs, candidate['available_at'])
 
@@ -301,9 +245,7 @@ def compute_candidate_components(cancelled_leg, downstream_legs, candidate, rout
     if not own_legs:
         opportunity_cost = 0.0
     elif not downstream_legs:
-        # Nothing for the candidate to actually fly (e.g. the cancelled leg
-        # was the tail's last leg of the day) -- no repositioning cost, own
-        # schedule proceeds unaffected from available_at, same as before.
+        # Nothing for the candidate to fly -- no repositioning cost.
         opportunity_cost, _ = simulate_recovery(own_legs, candidate['available_at'])
     else:
         segment_destination = downstream_legs[-1][1]
@@ -336,24 +278,17 @@ def compute_candidate_components(cancelled_leg, downstream_legs, candidate, rout
 
 
 def compute_segment_cost(candidate, segment_legs, route_table, centrality_table, max_flight_count, max_betweenness, route_duration_table, airport_coords):
-    """
-    Feature 2's per-(candidate, contiguous segment) analog of
-    compute_candidate_components: the same four raw components, generalized
-    from a single cancelled_leg to a contiguous run of orphaned segment_legs.
+    """Feature 2's per-(candidate, contiguous segment) analog of
+    compute_candidate_components, generalized from a single cancelled_leg to
+    a run of orphaned segment_legs.
 
     opportunity_cost is seeded by a return-trip-adjusted availability time
-    (return_trip_estimate) rather than the candidate's raw available_at,
-    since a segment can end somewhere other than where the candidate's own
-    remaining legs begin -- the candidate has to physically get back there
-    first. Reuses simulate_recovery for both the induced-delay propagation
-    over segment_legs and the opportunity-cost propagation over the
-    candidate's own_remaining_legs; no parallel delay logic.
+    (return_trip_estimate), since a segment can end away from where the
+    candidate's own remaining legs begin.
 
-    Returns a components dict with the same four keys compute_
-    candidate_components uses (so replacement_score works unchanged),
-    though importance_of_cancelled_leg here means "importance of every leg
-    in this segment", summed -- the natural generalization of how
-    importance_of_candidates_own_legs already sums over own_legs.
+    Returns the same four keys as compute_candidate_components (so
+    replacement_score works unchanged); importance_of_cancelled_leg here
+    means the summed importance of every leg in the segment.
     """
     induced_delay_minutes, breakdown = simulate_recovery(segment_legs, candidate['available_at'])
 
@@ -390,20 +325,15 @@ def compute_segment_cost(candidate, segment_legs, route_table, centrality_table,
 
 
 def connecting_flights_missed(cancelled_leg, candidate, downstream_legs, legs_by_tail, departure_index=None):
-    """
-    Proxy for connecting passengers stranded by this candidate's delay --
+    """Proxy for connecting passengers stranded by this candidate's delay,
     NOT a real passenger count. Counts scheduled departures from the first
-    downstream leg's destination airport that fall between that leg's
-    original scheduled arrival and its simulated (delayed) arrival under
-    this candidate -- flights that would have been catchable on time but
-    are now missed because arrival slipped past their departure.
+    downstream leg's destination airport that fall between its original and
+    simulated (delayed) arrival -- flights missed because arrival slipped
+    past their departure.
 
-    departure_index: optional {(airport, date): sorted crs_dep_dt list}
-    from _build_departure_index. When supplied, the count is a bisect
-    lookup instead of a full linear scan over legs_by_tail -- same result,
-    since both count exactly the departures with window_start < t <
-    window_end. Defaults to None, preserving the original scan for any
-    caller that doesn't have the index built.
+    departure_index: optional {(airport, date): sorted crs_dep_dt list} from
+    _build_departure_index for a bisect lookup instead of a linear scan.
+    Defaults to None (original scan behavior).
     """
     if not downstream_legs:
         return 0
@@ -431,10 +361,8 @@ def connecting_flights_missed(cancelled_leg, candidate, downstream_legs, legs_by
     return count
 
 
-# Five weight vectors over the same three factors (delay, opportunity_cost,
-# importance) -- a stated modeling choice used to stress-test how sensitive
-# recommendations are to what the user says they care about, not a fitted
-# or derived set of coefficients.
+# Five weight vectors over the same three factors -- stated modeling
+# choices for stress-testing recommendation sensitivity, not fitted values.
 RANKING_MODES = {
     "minimize_this_flight_delay": {"delay": 0.7, "opportunity_cost": 0.15, "importance": 0.15},
     "minimize_total_delay": {"delay": 0.45, "opportunity_cost": 0.45, "importance": 0.10},
@@ -445,12 +373,10 @@ RANKING_MODES = {
 
 
 def replacement_score(components, mode):
-    """
-    Single sort key (lower = better) for one candidate under one ranking
-    mode. Same formula for every mode -- only the weight vector changes --
-    so every mode considers every factor and none can recommend a
-    Pareto-dominated candidate (a candidate strictly worse on every raw
-    component always scores strictly worse, for any positive weight vector).
+    """Single sort key (lower = better) for one candidate under one ranking
+    mode. Same formula for every mode, only the weight vector changes -- so a
+    candidate strictly worse on every raw component always scores worse
+    (never recommends a Pareto-dominated candidate).
     """
     weights = RANKING_MODES[mode]
     return (
@@ -463,24 +389,16 @@ def replacement_score(components, mode):
 
 
 def rank_candidates(cancelled_leg, downstream_legs, candidates, mode, route_table, centrality_table, legs_by_tail, route_duration_table=None, airport_coords=None, departure_index=None):
-    """
-    Score and sort every candidate under one ranking mode. The four STEP 1
-    components and the connecting_flights_missed proxy are computed once per
-    candidate regardless of mode -- mode only changes how they're weighted
-    into the final sort key.
+    """Score and sort every candidate under one ranking mode. Components and
+    the connecting_flights_missed proxy are computed once per candidate --
+    mode only changes how they're weighted into the final sort key.
 
     route_duration_table/airport_coords feed compute_candidate_components's
-    return-trip-aware opportunity_cost (see its docstring). route_duration_table
-    is built once here (like max_flight_count/max_betweenness) if not
-    supplied. airport_coords can't be derived from legs_by_tail (needs the
-    graph's node lat/lon) -- callers that can't supply it get {}, meaning
-    Tier 2 (no real direct route) return-trip legs fall back to
-    return_trip_estimate's flat MISSING_COORDS_FALLBACK_MINUTES instead of
-    true geography; Tier 1 (real-route) legs are unaffected either way.
+    return-trip-aware opportunity_cost; built/defaulted here if not supplied.
+    Without real airport_coords, Tier 2 return-trip legs fall back to
+    return_trip_estimate's flat MISSING_COORDS_FALLBACK_MINUTES.
 
-    departure_index: optional, passed straight through to
-    connecting_flights_missed (see its docstring) -- None preserves the
-    original linear-scan behavior.
+    departure_index: optional, passed through to connecting_flights_missed.
     """
     max_flight_count = route_table['flight_count'].max()
     max_betweenness = max(centrality_table.values())
@@ -511,14 +429,11 @@ def rank_candidates(cancelled_leg, downstream_legs, candidates, mode, route_tabl
 
 
 def get_orphaned_legs(legs_by_tail, tail_number, date, query_time):
-    """
-    Feature 2's analog of get_downstream_legs: every leg still scheduled on
-    tail_number's date strictly after query_time -- the whole remaining
-    chain orphaned by the tail going down entirely, not just one cancelled
-    leg's downstream. Uses crs_dep_dt (scheduled), matching this module's
-    scheduled-time convention (simulate_recovery runs off crs_dep_dt/
-    crs_arr_dt; the "departure" QUERY_TIME_FIELD convention established in
-    analysis/experiments/batch_disruption_check.py).
+    """Feature 2's analog of get_downstream_legs: every leg still scheduled
+    on tail_number's date strictly after query_time -- the whole remaining
+    chain orphaned by the tail going down entirely, not just one leg's
+    downstream. Uses crs_dep_dt (scheduled), matching this module's
+    scheduled-time convention.
     """
     query_dt = pd.to_datetime(f"{date} {query_time}")
     day_legs = [leg for leg in legs_by_tail.get(tail_number, []) if leg[2]['flight_date'] == date]
@@ -526,11 +441,9 @@ def get_orphaned_legs(legs_by_tail, tail_number, date, query_time):
 
 
 def _best_segment_for_candidate(candidate, orphaned_legs, start_idx, route_table, centrality_table, max_flight_count, max_betweenness, route_duration_table, airport_coords, mode):
-    """
-    Greedy extend-or-stop for ONE candidate starting at
-    orphaned_legs[start_idx]: extend the segment one leg at a time only
-    while doing so lowers replacement_score; stop at the first extension
-    that doesn't help. Not a fixed "always extend as far as possible" rule.
+    """Greedy extend-or-stop for ONE candidate starting at
+    orphaned_legs[start_idx]: extend the segment one leg at a time only while
+    it lowers replacement_score; stop at the first extension that doesn't.
     """
     length = 1
     components = compute_segment_cost(
@@ -558,34 +471,26 @@ def _best_segment_for_candidate(candidate, orphaned_legs, start_idx, route_table
 
 
 def assign_recovery_segments(tail, date, query_time, legs_by_tail, route_table, centrality_table, airport_coords, mode="all_factors_combined", route_duration_table=None):
-    """
-    Feature 2 greedy solver (whole-aircraft-down): the analog of
-    compute_recovery_improvement for when tail's ENTIRE remaining day, not
-    just one leg, is orphaned. Deviates from the originally sketched
-    signature by adding airport_coords (required -- return_trip_estimate's
-    ferry fallback needs real lat/lon, which nothing else in this module
-    tracks; callers should build it from the same rotation graph's node data
-    the frontend already uses) and route_duration_table (optional, built
-    once from legs_by_tail if not supplied).
+    """Feature 2 greedy solver (whole-aircraft-down): the analog of
+    compute_recovery_improvement for when tail's entire remaining day, not
+    just one leg, is orphaned. Requires airport_coords (return_trip_estimate's
+    ferry fallback needs real lat/lon -- build it from the rotation graph's
+    node data).
 
-    Every leg tail has scheduled strictly after query_time on date is
-    orphaned simultaneously (get_orphaned_legs). Unlike Feature 1, one
-    substitute may not cover the whole remaining chain -- a candidate covers
-    a contiguous run of orphaned legs starting wherever the current segment
-    begins, extended one leg at a time only while replacement_score says
-    extending is cheaper than stopping (_best_segment_for_candidate). Among
-    all candidates tried for a given starting leg, the one with the best
-    (lowest) score for its own best segment length wins, and however many
-    legs its segment covers gets locked in.
+    Every leg after query_time on date is orphaned at once (get_orphaned_legs).
+    Unlike Feature 1, one substitute may not cover the whole chain: a
+    candidate covers a contiguous run of legs, extended one at a time only
+    while replacement_score says extending is cheaper than stopping
+    (_best_segment_for_candidate). The candidate with the best score for its
+    own best segment length wins that starting leg.
 
-    If NO candidate exists at all for a given starting leg, that leg is
-    recorded uncovered and the search moves on to the next leg -- a real,
-    expected outcome (analysis/experiments/mass_disruption_stress_test.py
-    already found supply shortfall is the dominant real-world constraint
-    under simultaneous cancellations), not an error to special-case around.
+    A starting leg with no candidate at all is recorded uncovered and the
+    search continues -- an expected outcome (supply shortfall is the
+    dominant real-world constraint under simultaneous cancellations, see
+    analysis/experiments/mass_disruption_stress_test.py), not an error.
 
-    This is the greedy baseline only. The optimal DP/shortest-path benchmark
-    is a separate, later task -- not built here.
+    This is the greedy baseline; assign_recovery_segments_optimal is the
+    exhaustive-search version.
 
     Returns:
         {
@@ -615,16 +520,12 @@ def assign_recovery_segments(tail, date, query_time, legs_by_tail, route_table, 
 
     orphaned_legs = get_orphaned_legs(legs_by_tail, tail, date, query_time)
 
-    # Every position below calls find_swap_candidates with this same `date`
-    # -- precompute the day-filtered view once instead of re-scanning every
-    # tail's entire history on every position (see _day_filtered_legs_by_tail).
+    # Precompute the day-filtered view once (see _day_filtered_legs_by_tail)
+    # instead of re-scanning every tail's history at every position.
     day_legs_by_tail = _day_filtered_legs_by_tail(legs_by_tail, date)
 
-    # Tracks tails already assigned to an earlier segment in this same batch --
-    # find_swap_candidates only knows about real (pre-disruption) history, so
-    # without this a tail parked at two different orphaned legs' origins at
-    # their respective query times could otherwise be recommended to cover
-    # both simultaneously, which isn't physically possible.
+    # Tails already assigned to an earlier segment in this batch -- without
+    # this, the same tail could be recommended to cover two segments at once.
     claimed = set()
 
     segments = []
@@ -635,12 +536,9 @@ def assign_recovery_segments(tail, date, query_time, legs_by_tail, route_table, 
         leg_query_time = leg[2]['crs_dep_dt'].strftime('%H:%M')
 
         candidates = find_swap_candidates(day_legs_by_tail, origin, date, leg_query_time)
-        # The down tail itself must never be its own candidate -- BTS data
-        # doesn't know about this hypothetical event, so find_swap_candidates
-        # could otherwise read `tail` as "parked" between its own now-orphaned
-        # legs and recommend it to cover itself. Tails already claimed by an
-        # earlier segment in this batch are excluded for the same physical
-        # reason -- they're already committed elsewhere.
+        # Exclude the down tail itself (BTS data doesn't know about this
+        # hypothetical event, so it could otherwise appear "parked" between
+        # its own orphaned legs) and tails already claimed this batch.
         candidates = [c for c in candidates if c['tail_number'] != tail and c['tail_number'] not in claimed]
 
         if not candidates:
@@ -695,40 +593,31 @@ def assign_recovery_segments(tail, date, query_time, legs_by_tail, route_table, 
     }
 
 
-# Assumed modeling estimate for the cost of an outright cancellation, in
-# delay-minute-equivalent terms -- NOT derived or fitted from data. Used only
-# to produce a disclosed, stated headline percentage; the honest numbers
-# (cancellations_avoided, total_induced_delay_minutes) never depend on it.
+# Assumed modeling estimate for an outright cancellation's cost, in
+# delay-minute-equivalent terms -- NOT derived from data. Only affects the
+# headline percentage; cancellations_avoided/total_induced_delay_minutes
+# never depend on it.
 CANCELLATION_PENALTY_MINUTES = 300.0
 
 
 # assign_recovery_segments_optimal's (position, used-tail-set) state space is
-# NOT bounded by candidate-pool size anywhere below this point, and a busy
-# hub can plausibly present dozens of eligible candidates per position (fleet-
-# wide, Delta runs ~100-150 idle aircraft at any time -- see
-# analysis/experiments/fleet_ground_state_check.py). Since `used` tracks
-# specific tail identity, not a count, memoization barely collapses that
-# space -- real-world use of this DP produced multi-minute hangs. Two
-# independent, deliberately separate safety mechanisms:
-MAX_CANDIDATES_PER_POSITION = 8   # heuristic branching-factor narrowing (see _top_candidates) -- shrinks typical-case work, not itself a correctness guarantee
-MAX_DP_STATES = 10_000            # hard, unconditional ceiling on exhaustive search (see solve() in assign_recovery_segments_optimal) -- on exceeding it, the DP aborts and falls back to the plain greedy result, which trivially preserves optimal_total <= greedy_total (equality in the fallback case) regardless of input
+# unbounded by candidate-pool size, and memoization barely collapses it since
+# `used` tracks specific tail identity -- unbounded DP runs produced
+# multi-minute hangs. Two independent safety mechanisms:
+MAX_CANDIDATES_PER_POSITION = 8   # branching-factor narrowing (see _top_candidates) -- a heuristic, not a correctness guarantee
+MAX_DP_STATES = 10_000            # hard ceiling on states explored (see solve()); exceeding it aborts to the greedy fallback
 
 
 def compute_recovery_improvement(cancelled_leg, downstream_legs, candidates, mode, route_table, centrality_table, legs_by_tail, route_duration_table=None, airport_coords=None, ranked=None, departure_index=None):
-    """
-    Compares the baseline (no intervention -- every downstream leg is
-    cancelled) against using the best-ranked candidate under the given mode.
-    Returns both an honest two-number breakdown and a headline percentage
-    built from a disclosed, stated penalty constant.
+    """Compares the baseline (no intervention -- every downstream leg
+    cancelled) against the best-ranked candidate under the given mode.
+    Returns an honest two-number breakdown plus a headline percentage built
+    from a disclosed penalty constant.
 
-    route_duration_table/airport_coords/departure_index are passed through
-    to rank_candidates unchanged -- see its docstring. Irrelevant when
-    `ranked` is already supplied, since rank_candidates is skipped entirely.
-
+    route_duration_table/airport_coords/departure_index pass through to
+    rank_candidates unchanged (ignored if `ranked` is already supplied).
     ranked: pass an already-computed rank_candidates(...) result to skip
-    re-ranking when the caller already needed it for its own purposes (e.g.
-    to also return the full ranked list); left as None to rank internally,
-    same as before.
+    re-ranking when the caller needs it for its own purposes too.
 
     Returns:
         {
@@ -743,11 +632,8 @@ def compute_recovery_improvement(cancelled_leg, downstream_legs, candidates, mod
     baseline_cost_minutes = cancellations_avoided * CANCELLATION_PENALTY_MINUTES
 
     if not candidates:
-        # No viable candidate at all -- nothing can be done, so the outcome
-        # IS the baseline (every downstream leg is genuinely cancelled).
-        # There's no substitute to simulate, so no induced-delay figure
-        # exists to report; 0% improvement is the honest characterization
-        # -- nothing changed from doing nothing.
+        # No viable candidate -- outcome is the baseline; 0% improvement is
+        # the honest characterization since nothing changed.
         return {
             "cancellations_avoided": cancellations_avoided,
             "total_induced_delay_minutes": None,
@@ -765,9 +651,8 @@ def compute_recovery_improvement(cancelled_leg, downstream_legs, candidates, mod
     total_induced_delay_minutes = best["delay"]
 
     if baseline_cost_minutes == 0:
-        # No downstream legs -- there was nothing to disrupt in the first
-        # place, so "100% avoided" is the vacuous-but-honest answer rather
-        # than an undefined 0/0 division.
+        # Nothing to disrupt in the first place -- "100% avoided" is the
+        # vacuous-but-honest answer rather than an undefined 0/0 division.
         improvement_pct = 100.0
     else:
         improvement_pct = (baseline_cost_minutes - total_induced_delay_minutes) / baseline_cost_minutes * 100
@@ -793,26 +678,20 @@ def _uncovered_segment(leg):
 
 
 class _DPStateBudgetExceeded(Exception):
-    """Internal control-flow signal only, raised by assign_recovery_segments_
-    optimal's solve() once MAX_DP_STATES new (non-memoized) states have been
-    explored. Caught at the top of assign_recovery_segments_optimal itself --
-    never escapes this module. An exception (rather than a sentinel value
-    threaded through solve/best_for_candidate's mutual recursion) keeps the
-    abort a single unwind through however many stack frames are active,
-    instead of every caller needing to check-and-propagate a special value at
-    each of the two recursive functions' several return points.
+    """Internal control-flow signal: raised by solve() once MAX_DP_STATES
+    states have been explored, caught at the top of
+    assign_recovery_segments_optimal. Used instead of threading a sentinel
+    through solve/best_for_candidate's mutual recursion, so the abort is a
+    single unwind rather than a check at every return point.
     """
 
 
 def _top_candidates(pool, leg, route_table, centrality_table, max_flight_count, max_betweenness,
                      route_duration_table, airport_coords, mode, limit=MAX_CANDIDATES_PER_POSITION):
-    """Rank `pool` (already location/status/self-exclusion filtered) by each
-    candidate's own length-1-segment replacement_score for this one leg, and
-    keep only the top `limit`. A cheap, position-local heuristic used only to
-    shrink the DP's branching factor -- NOT the DP's real objective (which can
-    extend a segment past length 1 and accounts for `used`-set exclusions this
-    single-leg score can't see). Reuses compute_segment_cost/replacement_score
-    unchanged -- no new scoring logic.
+    """Rank `pool` by each candidate's length-1-segment replacement_score for
+    this leg and keep the top `limit`. A cheap heuristic to shrink the DP's
+    branching factor -- not the DP's real objective, which can extend
+    segments past length 1 and sees `used`-set exclusions this can't.
     """
     if len(pool) <= limit:
         return pool
@@ -831,54 +710,29 @@ def _top_candidates(pool, leg, route_table, centrality_table, max_flight_count, 
 def assign_recovery_segments_optimal(tail, date, query_time, legs_by_tail,
                                        route_table, centrality_table, airport_coords,
                                        mode="all_factors_combined", route_duration_table=None):
-    """
-    Optimal version of assign_recovery_segments -- considers the full
-    segmentation+assignment space simultaneously via memoized recursion
-    over (position, used-candidates) state, rather than committing to each
-    segment greedily as it goes. Reuses compute_segment_cost, replacement_score,
-    and CANCELLATION_PENALTY_MINUTES -- no new cost logic invented here, only
-    a new search strategy over the same costs.
+    """Optimal version of assign_recovery_segments: considers the full
+    segmentation+assignment space via memoized recursion over
+    (position, used-candidates) state, instead of committing greedily.
+    Reuses compute_segment_cost/replacement_score/CANCELLATION_PENALTY_MINUTES
+    -- only the search strategy is new. Requires airport_coords, same reason
+    as assign_recovery_segments.
 
-    Deviates from the originally sketched signature by adding airport_coords
-    (required) and route_duration_table (optional) -- the same deviation
-    assign_recovery_segments itself documents and for the same reason:
-    compute_segment_cost/return_trip_estimate need real coordinates, which
-    can't be derived from legs_by_tail alone.
-
-    State space: (position in orphaned_legs, frozenset of tail_numbers
-    already used by an earlier segment in this same path). Position alone
-    isn't enough state -- without the used-set, the same tail could be
-    reused for two different segments, the same physical impossibility
-    Part 1's `claimed` set fixes for the greedy solver. A downed aircraft's
-    remaining-day leg count is small (single digits), but candidate-pool
-    size per position is NOT bounded by that -- a busy hub can present
-    dozens of eligible candidates, and since memoization keys on specific
-    tail identity (not a count) it barely collapses that space. Two
-    deliberately separate safety mechanisms bound this in practice (see
-    MAX_CANDIDATES_PER_POSITION/MAX_DP_STATES): candidates_at is narrowed to
-    the top MAX_CANDIDATES_PER_POSITION per position by a cheap heuristic
-    (_top_candidates) before the DP ever sees them, and solve() aborts via
-    _DPStateBudgetExceeded once MAX_DP_STATES distinct states have been
-    explored, falling back to the plain greedy result -- which trivially
-    preserves "optimal never worse than greedy" (equality in the fallback
-    case) regardless of input, independent of whether the heuristic narrowing
-    above happened to keep the true optimum in play.
+    State: (position in orphaned_legs, frozenset of tails already used by an
+    earlier segment in this path) -- the used-set prevents the same physical
+    impossibility Part 1's `claimed` set fixes for the greedy solver. Candidate
+    pools aren't bounded by the small orphaned-leg count, so two safety
+    mechanisms keep this tractable: candidates_at is narrowed to the top
+    MAX_CANDIDATES_PER_POSITION per position (_top_candidates), and solve()
+    aborts via _DPStateBudgetExceeded past MAX_DP_STATES states, falling back
+    to the greedy result (which trivially satisfies "optimal >= greedy").
 
     Edges out of a state (position, used):
-      - "assign": pick a candidate (parked at this leg's origin, at this
-        leg's query time, not the down tail itself, not already in `used`)
-        and a segment length -- weight is compute_segment_cost's
-        replacement_score for that (candidate, segment) pair, taken as-is.
-      - "uncovered": skip exactly this one leg -- weight is
-        CANCELLATION_PENALTY_MINUTES, the same stated modeling constant
-        compute_recovery_improvement already uses for an outright
-        cancellation.
-    Goal: shortest path from (0, frozenset()) to any state where
-    position == len(orphaned_legs).
+      - "assign": pick an eligible candidate and segment length -- weight is
+        compute_segment_cost's replacement_score for that pair.
+      - "uncovered": skip this leg -- weight is CANCELLATION_PENALTY_MINUTES.
+    Goal: shortest path from (0, frozenset()) to position == len(orphaned_legs).
 
-    Returns the same shape as assign_recovery_segments:
-        {"segments": [...], "total_orphaned_legs", "total_covered_legs",
-         "total_uncovered_legs", "num_segments", "total_induced_delay_minutes"}
+    Returns the same shape as assign_recovery_segments.
     """
     if route_duration_table is None:
         route_duration_table = _build_route_duration_table(legs_by_tail)
@@ -889,14 +743,12 @@ def assign_recovery_segments_optimal(tail, date, query_time, legs_by_tail,
     orphaned_legs = get_orphaned_legs(legs_by_tail, tail, date, query_time)
     n = len(orphaned_legs)
 
-    # Every position below calls find_swap_candidates with this same `date`
-    # -- precompute the day-filtered view once instead of re-scanning every
-    # tail's entire history on every position (see _day_filtered_legs_by_tail).
+    # Precompute the day-filtered view once (see _day_filtered_legs_by_tail)
+    # instead of re-scanning every tail's history at every position.
     day_legs_by_tail = _day_filtered_legs_by_tail(legs_by_tail, date)
 
-    # Eligible candidates per position depend only on that leg's (origin,
-    # query_time), never on which tails a given path has already used --
-    # so this is computed once per position, not once per DP state.
+    # Eligible candidates per position depend only on (origin, query_time),
+    # never on `used` -- computed once per position, not once per DP state.
     candidates_at = []
     for leg in orphaned_legs:
         leg_query_time = leg[2]['crs_dep_dt'].strftime('%H:%M')
@@ -909,25 +761,20 @@ def assign_recovery_segments_optimal(tail, date, query_time, legs_by_tail,
 
     memo = {}
     # (position, candidate_tail, length) -> (components, score). Unlike memo
-    # (keyed on `used`, since which candidates are still free genuinely
-    # changes the best continuation), compute_segment_cost/replacement_score
-    # for a given (position, candidate, length) never depend on `used` at
-    # all -- so without this, the same segment cost gets recomputed from
-    # scratch for every distinct `used` set that reaches this position, even
-    # though the answer is identical every time. Pure caching of a
-    # side-effect-free computation -- doesn't change any result (confirmed
-    # via byte-identical before/after diffs on 5 real cases).
+    # (keyed on `used`), segment cost never depends on `used` -- without this
+    # cache, the same segment cost would be recomputed for every distinct
+    # `used` set reaching this position. Pure caching, doesn't change results
+    # (confirmed via byte-identical before/after diffs on 5 real cases).
     segment_cost_cache = {}
 
-    # Counts distinct (position, used) states actually explored (memo
-    # misses only) -- the hard, unconditional ceiling on exhaustive search;
-    # see MAX_DP_STATES and solve() below.
+    # Distinct (position, used) states explored (memo misses only) -- the
+    # hard ceiling on exhaustive search; see MAX_DP_STATES and solve() below.
     state_count = 0
 
     def best_for_candidate(position, candidate, used):
         """Best (cost, segments-for-suffix) over every segment length this
-        one candidate could take starting at `position`. Split out from
-        solve() purely to keep each function's branching shallow.
+        candidate could take starting at `position`. Split out from solve()
+        to keep each function's branching shallow.
         """
         candidate_tail = candidate["tail_number"]
         best_cost, best_segments = None, None
@@ -987,10 +834,9 @@ def assign_recovery_segments_optimal(tail, date, query_time, legs_by_tail,
     try:
         _, segments = solve(0, frozenset())
     except _DPStateBudgetExceeded:
-        # Exhaustive search blew past MAX_DP_STATES -- abort and defer to the
-        # greedy solver outright rather than return a partial/unsound search.
-        # Same return shape as this function already produces, and trivially
-        # satisfies "optimal never worse than greedy" (equality here).
+        # Blew past MAX_DP_STATES -- defer to the greedy solver rather than
+        # return a partial/unsound search. Same shape, trivially satisfies
+        # "optimal never worse than greedy" (equality here).
         return assign_recovery_segments(
             tail, date, query_time, legs_by_tail, route_table, centrality_table,
             airport_coords, mode=mode, route_duration_table=route_duration_table,
@@ -1024,7 +870,7 @@ if __name__ == "__main__":
     df = pd.read_csv(GRAPH_PATH.parent / "delta_ontime_with_datetimes.csv", low_memory=False)
     route_table = compute_route_delay_summary(df)
 
-    G_weighted = build_weighted_graph(G)  # reuse the already-loaded rotation graph
+    G_weighted = build_weighted_graph(G)
     centrality_table = compute_betweenness_centrality(G_weighted)
 
     legs_by_tail = {}
@@ -1033,11 +879,8 @@ if __name__ == "__main__":
     for tail in legs_by_tail:
         legs_by_tail[tail].sort(key=lambda e: e[2]['crs_dep_dt'])
 
-    # Built once, up front, so every test below (not just the Feature 2
-    # section at the end) uses real return-trip data for the now-fixed
-    # opportunity_cost calculation, instead of the {}/auto-build defaults
-    # rank_candidates/compute_recovery_improvement fall back to when a
-    # caller can't supply them.
+    # Built once, up front, so every test below uses real return-trip data
+    # instead of the {}/auto-build defaults.
     airport_coords = {
         code: (data['lat'], data['lon'])
         for code, data in G.nodes(data=True)
@@ -1045,9 +888,8 @@ if __name__ == "__main__":
     }
     route_duration_table = _build_route_duration_table(legs_by_tail)
 
-    # Real scenario: N101DQ lands JFK->MCO (actual arrival 09:53) on 2025-01-01,
-    # then sits at MCO until its own MCO->SLC leg (scheduled 11:10). At 10:30
-    # it's a known parked-at-MCO candidate.
+    # N101DQ lands JFK->MCO (actual arrival 09:53) on 2025-01-01, then sits at
+    # MCO until its own MCO->SLC leg (scheduled 11:10) -- a known candidate at 10:30.
     candidates = find_swap_candidates(legs_by_tail, 'MCO', '2025-01-01', '10:30')
     by_tail = {c['tail_number']: c for c in candidates}
     assert 'N101DQ' in by_tail, "N101DQ should be a known candidate parked at MCO at 10:30"
@@ -1063,8 +905,7 @@ if __name__ == "__main__":
     print(f"MCO @ 10:30: {len(candidates)} candidates, N101DQ available_at={entry['available_at']}, "
           f"own_remaining_legs={[(u, v) for u, v, _ in entry['own_remaining_legs']]}")
 
-    # ATL at this date/time has well over 5 tails parked -- confirms the old
-    # max_candidates=5 cutoff no longer silently truncates the pool.
+    # Confirms the old max_candidates=5 cutoff no longer truncates the pool.
     atl_candidates = find_swap_candidates(legs_by_tail, 'ATL', '2025-01-01', '10:30')
     assert len(atl_candidates) > 5, (
         f"expected more than 5 candidates at ATL to prove the early cutoff is gone, "
@@ -1073,9 +914,8 @@ if __name__ == "__main__":
     print(f"ATL @ 10:30: {len(atl_candidates)} candidates (old code would have capped this at 5)")
 
     # --- find_swap_candidates: "flew today" filter, real leaky-parked case ---
-    # N178DN / 2025-09-10: JFK->SFO, Cancelled=0.0, Diverted=1.0, dep_dt/
-    # wheels_off real but arr_dt/wheels_on are NaT (no real arrival
-    # recorded). This is the only leg that tail has that day.
+    # N178DN / 2025-09-10: JFK->SFO, Diverted, dep_dt/wheels_off real but
+    # arr_dt/wheels_on are NaT. Only leg that tail has that day.
     n178dn_day = [leg for leg in legs_by_tail['N178DN'] if leg[2]['flight_date'] == '2025-09-10']
     assert len(n178dn_day) == 1, f"expected exactly one leg for N178DN on 2025-09-10, got {len(n178dn_day)}"
     leg_data = n178dn_day[0][2]
@@ -1083,10 +923,8 @@ if __name__ == "__main__":
         "expected N178DN's leg to be the not-cancelled/real-departure/NaT-arrival case this filter targets"
     )
 
-    # Confirm classify_aircraft_status's leak is real and untouched: this leg,
-    # taken alone, still reads as 'parked' at SFO (NaT is not None, so `if arr
-    # is None` never fires) -- proving the filter in find_swap_candidates is
-    # doing real work, not screening out something already excluded upstream.
+    # Confirms classify_aircraft_status's leak is real: this leg still reads
+    # as 'parked' at SFO, proving find_swap_candidates's filter does real work.
     leaky_state = get_aircraft_state(n178dn_day, pd.to_datetime('2025-09-10 20:00'))
     assert leaky_state['status'] == 'parked' and leaky_state['destination'] == 'SFO', (
         f"expected the pre-existing NaT-arrival leak to still classify this leg as parked at SFO, "
@@ -1105,7 +943,7 @@ if __name__ == "__main__":
 
     # --- simulate_recovery: synthetic chain ---
     # A->B has a 60 min buffer to B->C; B->C has a 45 min buffer to C->D;
-    # C->D's own turnaround_to_next is None (last leg / case-5 fixture).
+    # C->D is the last leg (turnaround_to_next=None).
     leg_ab = ('A', 'B', {
         'crs_dep_dt': pd.Timestamp('2025-01-01 10:00'),
         'crs_arr_dt': pd.Timestamp('2025-01-01 11:00'),
@@ -1131,9 +969,8 @@ if __name__ == "__main__":
     )
     print(f"Case 1 (on time): total={total}")
 
-    # Case 2: 30 min late -- eats half of leg A->B's 60 min buffer.
-    # Leg A->B is the one that's actually late, so IT shows the nonzero delay;
-    # its buffer fully absorbs that delay before it reaches B->C.
+    # Case 2: 30 min late -- A->B shows the delay, its 60 min buffer fully
+    # absorbs it before reaching B->C.
     total, breakdown = simulate_recovery(synthetic_chain, pd.Timestamp('2025-01-01 10:30'))
     assert breakdown[0]['induced_delay_minutes'] == 30.0, (
         f"expected leg A->B (the late leg) to show 30.0 induced delay, got {breakdown[0]}"
@@ -1144,8 +981,8 @@ if __name__ == "__main__":
     assert breakdown[2]['induced_delay_minutes'] == 0.0, "expected nothing to carry to C->D either"
     print(f"Case 2 (30 min late, buffer absorbs): total={total}, per-leg={[b['induced_delay_minutes'] for b in breakdown]}")
 
-    # Case 3: 90 min late -- fully exceeds leg A->B's 60 min buffer, so 30 min
-    # excess carries into B->C; B->C's own 45 min buffer then absorbs that 30.
+    # Case 3: 90 min late -- exceeds A->B's 60 min buffer, 30 min excess
+    # carries to B->C, whose 45 min buffer then absorbs it.
     total, breakdown = simulate_recovery(synthetic_chain, pd.Timestamp('2025-01-01 11:30'))
     assert breakdown[0]['induced_delay_minutes'] == 90.0, f"expected A->B to show 90.0, got {breakdown[0]}"
     assert breakdown[1]['induced_delay_minutes'] == 30.0, (
@@ -1163,8 +1000,8 @@ if __name__ == "__main__":
     )
     print("Case 4 (empty downstream_legs): (0.0, []) as expected")
 
-    # Case 5: missing turnaround_to_next on the upstream leg -- treated as a
-    # zero buffer, so the full upstream delay carries forward unreduced.
+    # Case 5: missing turnaround_to_next -- treated as zero buffer, full
+    # delay carries forward.
     leg_missing_buffer = ('X', 'Y', {
         'crs_dep_dt': pd.Timestamp('2025-01-01 08:00'),
         'crs_arr_dt': pd.Timestamp('2025-01-01 09:00'),
@@ -1193,10 +1030,8 @@ if __name__ == "__main__":
     print("Case 6 (substitute_available_at=None): raised ValueError as expected")
 
     # --- simulate_recovery: real N101DQ / 2025-01-01 scenario ---
-    # MCO->SLC scheduled dep 11:10, turnaround_to_next=71.0; SLC->MSP
-    # turnaround_to_next=168.0. Substitute available at 13:00 (110 min late
-    # vs. 11:10). Hand trace: MCO->SLC=110, SLC->MSP=max(0,110-71)=39,
-    # MSP->BZN=max(0,39-168)=0. Total=149.0.
+    # Substitute available 13:00 (110 min late vs. MCO->SLC's 11:10 dep).
+    # Hand trace: MCO->SLC=110, SLC->MSP=max(0,110-71)=39, MSP->BZN=max(0,39-168)=0. Total=149.0.
     cancelled_leg_real, real_downstream = get_downstream_legs(legs_by_tail, 'N101DQ', '2025-01-01', 'JFK', 'MCO')
     total, breakdown = simulate_recovery(real_downstream, pd.Timestamp('2025-01-01 13:00:00'))
     expected_per_leg = [110.0, 39.0, 0.0]
@@ -1213,15 +1048,11 @@ if __name__ == "__main__":
               f"actual_departure={leg['actual_departure']}, actual_arrival={leg['actual_arrival']}")
 
     # --- importance_weight: real high-centrality (ATL) vs high-traffic/low-centrality (Florida) route ---
-    # Precompute both maxes once -- passed into every importance_weight call
-    # below rather than recomputed per-call, since replacement_score will call
-    # this per-candidate (78+ times for a single busy-hub disruption) and the
-    # underlying route_table/centrality_table don't change within a request.
     max_flight_count = route_table['flight_count'].max()
     max_betweenness = max(centrality_table.values())
 
-    # MCO->RDU has MORE raw traffic than ATL->TUS, yet scores far lower -- this
-    # is what proves centrality weighting dominates rather than just correlates.
+    # MCO->RDU has MORE raw traffic than ATL->TUS, yet scores far lower --
+    # proves centrality weighting dominates rather than just correlates.
     atl_traffic, atl_btw = route_table.loc[('ATL', 'TUS'), 'flight_count'], max(
         centrality_table.get('ATL', 0.0), centrality_table.get('TUS', 0.0)
     )
@@ -1258,9 +1089,8 @@ if __name__ == "__main__":
     print(f"Synthetic missing airport (ATL deleted from centrality_table): importance_weight={missing_airport_score}")
 
     # --- replacement_score: monotonicity ---
-    # For each factor, hold everything else fixed and make ONE component
-    # worse; assert no mode that weights that factor > 0 ever scores the
-    # worse candidate better (lower).
+    # Hold everything fixed, worsen one component; no mode weighting that
+    # factor > 0 should ever score the worse candidate better.
     base = {
         "induced_delay_minutes": 20.0,
         "opportunity_cost": 20.0,
@@ -1287,12 +1117,10 @@ if __name__ == "__main__":
     print("replacement_score: monotonicity confirmed across all 5 modes.")
 
     # --- replacement_score: Pareto-dominance ---
-    # "dominated" is strictly worse than "good" on all four raw components.
-    # Tested at the component-dict level (not via rank_candidates on two real
-    # candidates) because importance_of_cancelled_leg is the SAME cancelled
-    # leg for every candidate in one real ranking call -- a genuine
-    # worse-on-all-four real-candidate pair can't be constructed. This proves
-    # the guarantee directly from replacement_score's weighted-sum design.
+    # "dominated" is strictly worse than "good" on all four components.
+    # Tested at the component-dict level rather than via rank_candidates,
+    # since importance_of_cancelled_leg is shared across candidates in one
+    # real ranking call -- a genuine worse-on-all-four pair can't occur there.
     good = {
         "induced_delay_minutes": 10.0, "opportunity_cost": 10.0,
         "importance_of_cancelled_leg": 10.0, "importance_of_candidates_own_legs": 10.0,
@@ -1310,8 +1138,7 @@ if __name__ == "__main__":
 
     # --- replacement_score: naive-baseline comparison + weight-sensitivity spot-check ---
     # X: low delay, high opportunity cost. Y: moderate delay, low opportunity
-    # cost. A naive single-factor ranking (sort by delay alone) always picks
-    # X -- ignoring the network cost it imposes elsewhere.
+    # cost. Sorting by delay alone always picks X, ignoring the network cost.
     candidate_x = {
         "induced_delay_minutes": 5.0, "opportunity_cost": 60.0,
         "importance_of_cancelled_leg": 25.0, "importance_of_candidates_own_legs": 25.0,
@@ -1320,7 +1147,6 @@ if __name__ == "__main__":
         "induced_delay_minutes": 40.0, "opportunity_cost": 20.0,
         "importance_of_cancelled_leg": 25.0, "importance_of_candidates_own_legs": 25.0,
     }
-    # Naive baseline -- local to this validation block only, NOT exported.
     naive_pool = [("X", candidate_x), ("Y", candidate_y)]
     naive_winner, _ = min(naive_pool, key=lambda pair: pair[1]["induced_delay_minutes"])
     print(f"Naive baseline (sort by induced_delay_minutes alone) picks: {naive_winner}")
@@ -1340,9 +1166,8 @@ if __name__ == "__main__":
     )
 
     # --- replacement_score: extreme case, fully idle vs. busy candidate ---
-    # Shared downstream_legs/available_at/cancelled_leg -- isolates the
-    # own_remaining_legs difference. cancelled_leg uses fake airports so
-    # importance_of_cancelled_leg falls back to 0 for both candidates (tied).
+    # Shared downstream_legs/available_at/cancelled_leg isolates the
+    # own_remaining_legs difference (fake airports tie importance at 0).
     extreme_cancelled_leg = ('A', 'B', {})
     extreme_available_at = pd.Timestamp('2025-01-01 13:00:00')
 
@@ -1359,12 +1184,8 @@ if __name__ == "__main__":
     )
     print(f"Idle candidate components: {idle_components}")
     print(f"Busy candidate components: {busy_components}")
-    # BEFORE this fix: idle opportunity_cost=0.0 (unchanged, own_remaining_legs
-    # is empty either way), busy opportunity_cost=149.0 (raw available_at
-    # seed, no return-trip charge from fake destination 'D' back to real
-    # MCO). AFTER: idle stays 0.0; busy jumps because it's now charged a
-    # (fallback, since 'D' is synthetic/has no coords) return trip from 'D'
-    # back to MCO before its own real chain can resume.
+    # BEFORE: busy opportunity_cost=149.0 (no return-trip charge). AFTER:
+    # busy is charged a fallback return trip from fake 'D' back to MCO.
 
     for mode in RANKING_MODES:
         idle_score = replacement_score(idle_components, mode)
@@ -1377,8 +1198,7 @@ if __name__ == "__main__":
     print("replacement_score: idle candidate never scores worse than busy, across all 5 modes.")
 
     # --- rank_candidates: real N101DQ / 2025-01-01 scenario, all_factors_combined ---
-    # BEFORE this fix: N348NB=8.55, N831DN=8.57, N115DN=24.94, N101DQ=28.71,
-    # N6716C=137.05 (all delay=0.0, opportunity_cost=0.0 for every candidate).
+    # BEFORE this fix: all candidates had delay=0.0, opportunity_cost=0.0.
     ranked = rank_candidates(
         cancelled_leg_real, real_downstream, candidates, "all_factors_combined",
         route_table, centrality_table, legs_by_tail, route_duration_table, airport_coords,
@@ -1390,9 +1210,7 @@ if __name__ == "__main__":
               f"connecting_flights_missed={entry['connecting_flights_missed']}")
 
     # --- compute_recovery_improvement: real N101DQ / 2025-01-01 scenario ---
-    # BEFORE this fix: {'cancellations_avoided': 3, 'total_induced_delay_minutes':
-    # 0.0, 'baseline_cost_minutes': 900.0, 'improvement_pct': 100.0,
-    # 'best_candidate': 'N348NB'}.
+    # BEFORE this fix: improvement_pct=100.0 (opportunity_cost wasn't charged).
     real_improvement = compute_recovery_improvement(
         cancelled_leg_real, real_downstream, candidates, "all_factors_combined",
         route_table, centrality_table, legs_by_tail, route_duration_table, airport_coords,
@@ -1409,8 +1227,7 @@ if __name__ == "__main__":
     print("compute_recovery_improvement: improvement_pct is non-negative for the real N101DQ scenario.")
 
     # --- compute_recovery_improvement: synthetic empty-candidates edge case ---
-    # Unaffected by this fix -- candidates=[] short-circuits before
-    # rank_candidates/compute_candidate_components is ever called.
+    # candidates=[] short-circuits before rank_candidates is ever called.
     no_candidates_improvement = compute_recovery_improvement(
         cancelled_leg_real, real_downstream, [], "all_factors_combined",
         route_table, centrality_table, legs_by_tail, route_duration_table, airport_coords,
@@ -1437,8 +1254,7 @@ if __name__ == "__main__":
     print(f"\nreturn_trip_estimate('MCO', 'SLC') [Tier 1, real route]: {mco_slc_estimate:.1f} min")
 
     # --- return_trip_estimate: Tier 2, synthetic/rare pair with no real direct route ---
-    # Search programmatically for a real (has coords) airport pair with no
-    # direct scheduled route in this dataset, rather than assuming one.
+    # Search for a real airport pair with no direct scheduled route, rather than assuming one.
     coord_airports = sorted(airport_coords.keys())
     rare_pair = None
     for a in coord_airports:
@@ -1488,12 +1304,9 @@ if __name__ == "__main__":
         f"got {[(u, v) for u, v, d in orphaned_check]}"
     )
 
-    # Hand-verify the first segment's extend-or-stop decision: independently
-    # recompute both options (stop at 1 leg vs. extend to 2) for the actual
-    # winning candidate, via the same building blocks assign_recovery_segments
-    # itself uses (compute_segment_cost + replacement_score) but called
-    # directly here rather than through _best_segment_for_candidate's loop,
-    # then confirm the algorithm's choice matches whichever option scores lower.
+    # Hand-verify the first segment's extend-or-stop decision: recompute both
+    # options (stop at 1 leg vs. extend to 2) directly and confirm the
+    # algorithm's choice matches whichever scores lower.
     first_segment = segments_result['segments'][0]
     assert first_segment['tail_number'] is not None, "expected the first segment to find a real candidate"
 
@@ -1534,11 +1347,8 @@ if __name__ == "__main__":
         print(f"  stopping at 1 leg was cheaper (or equal) -- algorithm's segment length ({chosen_length}) is consistent with that.")
 
     # --- N348NB Feature 1 (fixed) vs. Feature 2 parity check ---
-    # Confirms the compute_candidate_components fix above: for the exact
-    # same single-leg scenario (N348NB covering MCO->SLC only, found at the
-    # leg's own 11:10 departure), Feature 1's opportunity_cost should now
-    # come out identical to compute_segment_cost's -- same formula, same
-    # inputs. BEFORE this fix, Feature 1 reported 0.0 here.
+    # For the same single-leg scenario, Feature 1's opportunity_cost should
+    # now match compute_segment_cost's exactly. BEFORE this fix: 0.0.
     n348nb_candidate = next(c for c in first_leg_candidates if c['tail_number'] == 'N348NB')
 
     f1_fixed_components = compute_candidate_components(
@@ -1564,13 +1374,9 @@ if __name__ == "__main__":
     print("  Feature 1 (fixed) and Feature 2 opportunity_cost match exactly, as expected.")
 
     # --- assign_recovery_segments: synthetic uncovered-leg edge case ---
-    # DOWN1's own two orphaned legs: RRR->SSS has no candidate anywhere in
-    # this tiny synthetic world (DOWN1 itself would otherwise be its own only
-    # "candidate" -- proving the self-exclusion filter matters, not just a
-    # trivially-empty pool); SSS->TTT does have one real candidate, HELPER1,
-    # parked there in time -- proving the algorithm marks the first leg
-    # uncovered and continues on to find a real segment for the second,
-    # rather than stopping or crashing.
+    # DOWN1's RRR->SSS has no candidate (DOWN1 itself would otherwise be its
+    # own only "candidate", testing self-exclusion); SSS->TTT has HELPER1 --
+    # proves the algorithm marks the first leg uncovered and continues.
     synthetic_legs_by_tail = {
         'DOWN1': [
             ('QQQ', 'RRR', {
@@ -1647,14 +1453,12 @@ if __name__ == "__main__":
     print("\nPart 1 fix: real N101DQ scenario byte-identical to the recorded pre-fix result "
           "(no collision existed here, so the claimed-set exclusion is correctly a no-op).")
 
-    # --- synthetic candidate-reuse collision, engineered to force a collision ---
-    # under the OLD (pre-fix) logic. DOWN2's two orphaned legs are O1->O2 and
-    # O2->O3. HELPER2 is parked at O1 before leg 1's query time (making it
-    # segment 1's only candidate) AND -- because it independently flies
-    # O1->O2 itself in this synthetic history -- also parked at O2 before
-    # leg 2's query time (making it segment 2's only candidate too). Without
-    # the claimed-set fix, HELPER2 would be recommended for BOTH segments
-    # simultaneously -- physically impossible for one tail.
+    # --- synthetic candidate-reuse collision, engineered against OLD (pre-fix) logic ---
+    # DOWN2's legs are O1->O2 and O2->O3. HELPER2 is parked at O1 before leg 1's
+    # query time (segment 1's only candidate) and, because it independently
+    # flies O1->O2 itself, also parked at O2 before leg 2's query time
+    # (segment 2's only candidate too) -- without the claimed-set fix it
+    # would be recommended for both segments at once.
     collision_legs_by_tail = {
         'DOWN2': [
             ('AAA', 'O1', {
@@ -1695,10 +1499,8 @@ if __name__ == "__main__":
         ],
     }
 
-    # Confirm the collision precondition is real: HELPER2's raw candidate pool
-    # (before any claimed-set exclusion) independently includes it for BOTH
-    # segments' searches -- this is exactly what the old code would have
-    # double-booked.
+    # Confirm the collision precondition: HELPER2's raw pool (pre-claimed-set)
+    # independently includes it for both segments' searches.
     seg1_raw_candidates = find_swap_candidates(collision_legs_by_tail, 'O1', '2025-07-01', '10:00')
     seg2_raw_candidates = find_swap_candidates(collision_legs_by_tail, 'O2', '2025-07-01', '13:00')
     seg1_tails = {c['tail_number'] for c in seg1_raw_candidates}
@@ -1785,9 +1587,8 @@ if __name__ == "__main__":
         print("  segment assignments are identical between greedy and optimal.")
 
     # --- scenario B: a real scenario with MORE orphaned legs than N101DQ's 3 ---
-    # Found programmatically (first tail/date match, sorted for reproducibility)
-    # rather than hand-picked: scan for a tail/date with a busy enough day that,
-    # probed right after its first leg lands, more than 3 legs are still orphaned.
+    # Found programmatically (first match, sorted for reproducibility): a
+    # busy day where, probed right after the first leg lands, >3 legs remain.
     big_scenario = None
     for candidate_tail in sorted(legs_by_tail):
         by_date = {}

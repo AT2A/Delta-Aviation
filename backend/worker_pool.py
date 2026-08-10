@@ -1,17 +1,9 @@
 """
-Small hand-rolled replacement for concurrent.futures.ProcessPoolExecutor,
-built specifically because ProcessPoolExecutor cannot cancel a task once it
-has started running (a well-known Python limitation: Future.cancel() returns
-False once the call is underway, and there's no public API to kill the
-underlying OS process). backend/main.py's /disrupt/aircraft-down "optimal"
-path previously wrapped a ProcessPoolExecutor future in asyncio.wait_for(...,
-timeout=...) -- timing out only stopped the *caller* waiting; the abandoned
-computation kept running in the worker process indefinitely, wasting a pool
-slot and (via analysis/disruption.py's now-fixed DP blowup) growing memory
-without bound. This module gives the caller a real, killable handle instead.
-
-Uses only public multiprocessing APIs (Process, Queue) -- no reliance on
-ProcessPoolExecutor's private internals.
+Hand-rolled replacement for concurrent.futures.ProcessPoolExecutor, whose
+Future.cancel() can't stop a task once it's running -- a timed-out call kept
+running in its worker indefinitely, leaking memory. This module terminates
+the actual OS process on timeout instead. Uses only public multiprocessing
+APIs (Process, Queue).
 """
 import asyncio
 import itertools
@@ -19,34 +11,22 @@ import multiprocessing as mp
 import queue
 
 
-# Generous: real init_worker() (backend/solver_worker.py) reloads a full
-# graph pickle + rebuilds legs_by_tail into worker-local state, which is
-# multiple seconds even when it succeeds.
+# Generous: init_worker() (backend/solver_worker.py) reloads a full graph
+# pickle and rebuilds worker-local state, taking multiple seconds even on success.
 WORKER_READY_TIMEOUT_SECONDS = 120
 
 
 class WorkerInitError(Exception):
-    """Raised when a worker's initializer fails, or the worker doesn't
-    report ready within WORKER_READY_TIMEOUT_SECONDS. Surfaced loudly here
-    instead of silently leaving a dead worker in the idle queue -- without
-    this check, a worker that dies during init (confirmed to happen in
-    practice: this app's real graph pickle is large enough that concurrent
-    deserialization across multiple worker processes can raise MemoryError)
-    would sit in _idle looking healthy, and the first job routed to it would
-    hang forever: task_q.put() succeeds with no one left to read it, and
-    submit()'s timeout only bounds the "optimal" solver path -- ordinary
-    calls pass timeout=None.
+    """Raised when a worker's initializer fails or doesn't report ready in
+    time. Without this check a dead worker would sit in _idle looking
+    healthy, and the first job routed to it would hang forever.
     """
 
 
 def _worker_main(task_q, result_q, initializer, initargs):
-    """Entry point run inside each child process. Calls `initializer` once
-    (the same role backend/solver_worker.py's init_worker plays today --
-    building the worker-local graph/legs_by_tail/route_table/etc. into that
-    module's _worker_state), reports readiness, then loops forever: block
-    for a job, run it, report the result, loop again. Never returns under
-    normal operation -- the parent ends a worker's life by terminate()ing
-    the process, not by asking this loop to exit.
+    """Entry point run inside each child process: call `initializer` once,
+    report readiness, then loop forever running jobs. The parent ends a
+    worker's life by terminate()ing the process, not by signaling this loop.
     """
     try:
         initializer(*initargs)
@@ -64,10 +44,9 @@ def _worker_main(task_q, result_q, initializer, initargs):
 
 
 class _Worker:
-    """One live OS process plus its own dedicated task/result queues. A
-    terminated worker's queues are never reused -- its replacement always
-    gets a fresh pair, so a stale message from a killed worker can never be
-    mistaken for a new job's result.
+    """One live OS process plus its own task/result queues. A replacement
+    worker always gets a fresh pair, so a stale message from a killed worker
+    can never be mistaken for a new job's result.
     """
 
     def __init__(self, initializer, initargs):
@@ -82,11 +61,9 @@ class _Worker:
 
 
 def _spawn_ready_worker(initializer, initargs):
-    """Spawn a worker and block (this is meant to be called off the event
-    loop -- see start()/_replace_worker() below) until it confirms it
-    finished `initializer` successfully. Raises WorkerInitError rather than
-    returning a worker that looked fine but is actually dead or still
-    stuck mid-init.
+    """Spawn a worker and block (call off the event loop) until it confirms
+    `initializer` finished. Raises WorkerInitError rather than returning a
+    worker that's actually dead or still stuck mid-init.
     """
     worker = _Worker(initializer, initargs)
     try:
@@ -105,22 +82,15 @@ def _spawn_ready_worker(initializer, initargs):
 
 class KillableWorkerPool:
     """Fixed-size pool of persistent worker processes. Callers submit a
-    zero-arg picklable callable (e.g. a functools.partial) and get an
-    awaitable result back, same as loop.run_in_executor(process_pool, fn)
-    would -- except submit()'s own timeout is real: on expiry the specific
-    worker handling that job is terminate()d immediately (freeing its
-    memory right away, not "eventually") and a fresh replacement is spawned
-    in the background so pool capacity is restored without blocking the
-    request that just timed out.
+    zero-arg picklable callable and get an awaitable result, like
+    loop.run_in_executor(process_pool, fn) -- except submit()'s timeout is
+    real: on expiry the worker handling that job is terminate()d immediately
+    and a replacement spawns in the background.
 
-    Workers are spawned lazily, one at a time, the first N times submit()
-    needs one that doesn't exist yet -- not all eagerly in start() -- so
-    the peak "multiple processes deserializing the same large graph pickle
-    simultaneously" moment (the one that produced a real MemoryError in
-    testing on this machine) isn't concentrated at app startup. This also
-    matches the memory-timing behavior of the ProcessPoolExecutor this
-    replaces, which starts worker processes lazily on first submission
-    rather than at construction.
+    Workers spawn lazily, one at a time, on the first N submit() calls that
+    need one -- not all eagerly in start() -- so multiple processes never
+    deserialize the large graph pickle simultaneously at startup (that
+    produced a real MemoryError in testing).
     """
 
     def __init__(self, num_workers, initializer, initargs=()):
@@ -136,9 +106,8 @@ class KillableWorkerPool:
         self._idle = asyncio.Queue()
 
     async def _get_idle_worker(self):
-        """Returns an idle worker, spawning a brand-new one (lazily, up to
-        num_workers total) if the pool hasn't reached full size yet, rather
-        than only ever waiting on workers created in start().
+        """Returns an idle worker, lazily spawning a new one (up to
+        num_workers total) if the pool hasn't reached full size yet.
         """
         if self._spawned_count < self._num_workers and self._idle.empty():
             self._spawned_count += 1
@@ -148,10 +117,8 @@ class KillableWorkerPool:
                     None, _spawn_ready_worker, self._initializer, self._initargs
                 )
             except WorkerInitError:
-                # Undo the reservation -- otherwise a permanently-failing
-                # initializer would wedge the pool at "no capacity, no live
-                # workers, nothing in flight" forever, since spawned_count
-                # would stay pinned at num_workers with nothing to show for it.
+                # Undo the reservation, otherwise a permanently-failing
+                # initializer wedges the pool at zero capacity forever.
                 self._spawned_count -= 1
                 raise
             self._all_workers.append(worker)
@@ -164,18 +131,15 @@ class KillableWorkerPool:
         worker.task_q.put((job_id, fn))
 
         loop = asyncio.get_running_loop()
-        # worker.result_q.get() is a blocking call -- run it in the default
-        # thread pool executor so it doesn't block the event loop.
+        # Blocking get() runs in the default thread pool so it doesn't block the event loop.
         get_future = loop.run_in_executor(None, worker.result_q.get)
         try:
             returned_id, status, payload = await asyncio.wait_for(get_future, timeout=timeout)
         except asyncio.TimeoutError:
             worker.process.terminate()
-            # Unblocks the reader thread still parked in worker.result_q.get()
-            # -- cancelling get_future above doesn't stop a blocking call
-            # already running in a real OS thread, so without this the
-            # thread (and the default executor slot it holds) would leak
-            # forever once its worker is dead and can never reply on its own.
+            # Unblocks the reader thread still parked in result_q.get() -- cancelling
+            # get_future doesn't stop an in-progress blocking call in a real OS thread,
+            # so without this the thread/executor slot would leak forever.
             worker.result_q.put((job_id, "cancelled", None))
             self._all_workers.remove(worker)
             self._spawned_count -= 1
@@ -195,9 +159,8 @@ class KillableWorkerPool:
                 None, _spawn_ready_worker, self._initializer, self._initargs
             )
         except WorkerInitError:
-            # Replacement failed to come up -- pool permanently shrinks by
-            # one rather than silently reintroducing a dead worker. Loud
-            # (visible via exhausted capacity/logging), not silent.
+            # Replacement failed -- pool shrinks by one rather than silently
+            # reintroducing a dead worker.
             return
         self._spawned_count += 1
         self._all_workers.append(worker)

@@ -4,10 +4,7 @@ EARTH_RADIUS_NM = 3440.065  # mean Earth radius, nautical miles
 
 
 def _angular_distance_rad(lat1, lon1, lat2, lon2):
-    """Great-circle angular distance (radians) via the spherical law of
-    cosines. Factored out of great_circle_interpolate so
-    great_circle_distance_nm can reuse the exact same formula instead of
-    reimplementing it."""
+    """Great-circle angular distance (radians), via the spherical law of cosines."""
     lat1, lon1, lat2, lon2 = map(math.radians, [lat1, lon1, lat2, lon2])
     return math.acos(min(1, max(-1,
         math.sin(lat1)*math.sin(lat2) + math.cos(lat1)*math.cos(lat2)*math.cos(lon2-lon1)
@@ -79,8 +76,7 @@ if __name__ == "__main__":
     atl_sea_nm = great_circle_distance_nm(*atl, *sea)
     sea_atl_nm = great_circle_distance_nm(*sea, *atl)
     assert math.isclose(atl_sea_nm, sea_atl_nm, rel_tol=1e-9), "distance should be symmetric"
-    # ATL-SEA is a real ~2,180 sm / ~1,895 nm nonstop -- sanity-check the
-    # great-circle number lands in a plausible range for that route.
+    # Real ATL-SEA nonstop is ~1,895 nm; check the computed value is plausible.
     assert 1700 < atl_sea_nm < 2100, f"ATL-SEA great-circle distance out of plausible range: {atl_sea_nm} nm"
     print(f"ATL-SEA great-circle distance: {atl_sea_nm:.1f} nm (symmetric: {sea_atl_nm:.1f} nm)")
 

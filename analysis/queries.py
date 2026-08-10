@@ -2,10 +2,8 @@ import pandas as pd
 
 def build_flight_frame_from_graph(G):
     """(Origin, Dest, ArrDelay, Cancelled, Diverted, LateAircraftDelay) frame built from
-    edge attributes already on the loaded rotation graph, instead of re-parsing the source
-    CSV -- those attributes were themselves populated from this same CSV in build_graph.py,
-    so this is equivalent data without the redundant disk read.
-    """
+    the graph's edge attributes, avoiding a redundant CSV re-read (build_graph.py already
+    populated them from the same source)."""
     rows = [
         {
             'Origin': u,

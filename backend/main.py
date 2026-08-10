@@ -78,9 +78,8 @@ class AircraftState(BaseModel):
     destination: Optional[str] = None
     lat: Optional[float] = None
     lon: Optional[float] = None
-    # Present only for in_flight aircraft with valid timing -- lets the
-    # frontend keep interpolating this aircraft's position smoothly between
-    # /state polls instead of only ever seeing it at the exact query time.
+    # Set only for in_flight aircraft with valid timing, so the frontend can
+    # interpolate position between /state polls.
     wheels_off: Optional[str] = None
     wheels_on: Optional[str] = None
     origin_lat: Optional[float] = None
@@ -309,9 +308,8 @@ def get_state(date: str, time: str):
                 frac = (query_datetime - wheels_off) / (wheels_on - wheels_off)
                 frac = max(0.0, min(1.0, float(frac)))
                 lat, lon = great_circle_interpolate(origin_lat, origin_lon, dest_lat, dest_lon, frac)
-                # Same inputs used above -- expose them so the frontend can
-                # redo this interpolation itself for any time in between,
-                # instead of needing a fresh /state poll for every frame.
+                # Expose the same inputs so the frontend can redo this interpolation
+                # for any time in between, without a fresh /state poll per frame.
                 wheels_off_iso = wheels_off.isoformat()
                 wheels_on_iso = wheels_on.isoformat()
                 interp_origin_lat, interp_origin_lon = origin_lat, origin_lon
@@ -389,9 +387,8 @@ def disrupt_flight(request: DisruptRequest):
 
     downstream_legs = [f"{u}->{v}" for u, v, d in downstream]
 
-    # Candidates must be parked at the cancelled leg's DESTINATION (where the
-    # downstream chain begins), not its origin -- fixes a pre-existing bug
-    # where this call passed request.origin instead.
+    # Candidates must be parked at the cancelled leg's destination, where the
+    # downstream chain begins -- not its origin.
     candidates = find_swap_candidates(
         state['legs_by_tail'],
         request.destination,
