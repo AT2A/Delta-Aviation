@@ -48,7 +48,14 @@ function AirportAutocomplete({ value, onChangeText, onSelect, airports, placehol
         onChange={e => onChangeText(e.target.value)}
         onFocus={() => setFocused(true)}
         onBlur={() => setFocused(false)}
-        onKeyDown={e => { if (e.key === "Escape") e.target.blur() }}
+        onKeyDown={e => {
+          if (e.key === "Escape") e.target.blur()
+          if (e.key === "Enter" && suggestions.length > 0) {
+            e.preventDefault()
+            onSelect(suggestions[0].Origin)
+            e.target.blur()
+          }
+        }}
         style={{
           width: "100%", padding: "8px 10px", fontSize: "12.5px",
           fontFamily: "'JetBrains Mono', monospace", border: `1px solid ${theme.border}`,

@@ -1,7 +1,7 @@
 import DeckGL from "@deck.gl/react"
 import { Map } from "react-map-gl/maplibre"
 import { ScatterplotLayer, PathLayer, TextLayer } from "@deck.gl/layers"
-import { useState, useEffect, useMemo } from "react"
+import { useState, useEffect, useMemo, memo } from "react"
 import "maplibre-gl/dist/maplibre-gl.css"
 import { useTheme } from "../ThemeContext"
 
@@ -32,6 +32,31 @@ function scoreRoutes(routes) {
     .sort((a, b) => a.score - b.score) // hubs drawn last/on top
 }
 
+// Routes are static for the whole session -- they never change while the
+// app is running -- but MapView unmounts/remounts on every navigation
+// (React Router fully tears down page components), so without this, both
+// the ~35-50MB /routes fetch and the scoreRoutes() pass over it re-ran from
+// scratch on every visit to Overview or Live Replay, including navigating
+// away and back. Cached at module scope (survives unmount) instead of in
+// component state: the first caller kicks off the fetch+process and every
+// later caller (this mount or a future one) gets the same resolved promise.
+let routesCache = null
+function getRoutesData() {
+  if (!routesCache) {
+    routesCache = fetch("/routes")
+      .then(res => res.json())
+      .then(data => scoreRoutes(data.routes.map(r => ({
+        ...r,
+        // Flip [lat, lon] -> [lon, lat] once here instead of per-render
+        // inside getPath (which deck.gl would otherwise re-run on every
+        // route on every re-render, including ones where routes hasn't
+        // actually changed).
+        path: r.path ? r.path.map(([lat, lon]) => [lon, lat]) : r.path,
+      }))))
+  }
+  return routesCache
+}
+
 // aircraft status -> dot color
 const STATUS_COLOR = {
   in_flight: [80, 200, 120],
@@ -44,36 +69,49 @@ const STATUS_COLOR = {
 }
 
 // aircraft (optional): [{ tail_number, lat, lon, status }]
-function MapView({ aircraft, onAircraftClick, height = "100vh", selectedAirport = null }) {
+// colorRevision: opaque, at-most-once-a-second change signal for the
+// aircraft layer's getFillColor updateTrigger (Live.jsx's searchSnapshot)
+// -- not itself read for any color logic, just something that changes far
+// less often than `aircraft` (a new array reference every animation frame
+// during playback, since status can in principle change any frame) so
+// deck.gl doesn't reprocess the fill-color attribute for all ~1000 aircraft
+// 60x/sec when only position, not color, actually changes that often.
+function MapView({ aircraft, onAircraftClick, height = "100vh", selectedAirport = null, colorRevision = null }) {
   const { theme } = useTheme()
   const [airports, setAirports] = useState([])
   const [routes, setRoutes] = useState([])
-  const [routeLimit, setRouteLimit] = useState(null) // null = no cap (show all)
+  // Defaults to a cap, not null/"show all" -- a real Chrome Performance
+  // trace this session showed the GPU spending 83% of frame time
+  // rasterizing this layer's ~23,409 alpha-blended, overlapping lines every
+  // single frame (re-triggered whenever the aircraft layer changes, i.e.
+  // every animation frame during playback), which is what was actually
+  // behind the "not smooth" complaints -- not JS, which measured under 7%
+  // of frame time. scoreRoutes sorts ascending, so slice(-routeLimit) below
+  // still keeps the highest-scored/most-important routes. Users can still
+  // drag the slider up to all 23,409 if they want the full network.
+  const [routeLimit, setRouteLimit] = useState(3000)
 
   useEffect(() => {
     fetch("/airports/all")
       .then(res => res.json())
       .then(data => setAirports(data.airports))
 
-    fetch("/routes")
-      .then(res => res.json())
-      .then(data => setRoutes(scoreRoutes(data.routes.map(r => ({
-        ...r,
-        // Flip [lat, lon] -> [lon, lat] once here instead of per-render
-        // inside getPath (which deck.gl would otherwise re-run on every
-        // route on every re-render, including ones where routes hasn't
-        // actually changed).
-        path: r.path ? r.path.map(([lat, lon]) => [lon, lat]) : r.path,
-      })))))
+    getRoutesData().then(setRoutes)
   }, [])
 
-  const layers = useMemo(() => {
+  // Routes/airports/labels -- no `aircraft` dependency, so this doesn't
+  // rebuild every animation frame during playback, only when its own inputs
+  // (routes/airports/routeLimit/theme/selectedAirport) actually change.
+  // Route filtering here was the most expensive part of the old combined
+  // memo: up to 23,409 routes filtered/rebuilt on every frame it depended
+  // on `aircraft`, even though routes never change per-frame.
+  const staticLayers = useMemo(() => {
     const scopedRoutes = selectedAirport
       ? routes.filter(r => r.Origin === selectedAirport || r.Dest === selectedAirport)
       : routes
     const visibleRoutes = routeLimit != null ? scopedRoutes.slice(-routeLimit) : scopedRoutes
 
-    const result = [
+    return [
       new PathLayer({
         id: "routes",
         data: visibleRoutes.filter(d => d.path && d.path.length > 0),
@@ -120,35 +158,41 @@ function MapView({ aircraft, onAircraftClick, height = "100vh", selectedAirport 
         backgroundPadding: [3, 1],
       }),
     ]
+  }, [routes, airports, routeLimit, theme, selectedAirport])
 
-    if (aircraft && aircraft.length > 0) {
-      const positioned = aircraft.filter(a => a.lat != null && a.lon != null)
+  // Aircraft dots -- the only layer that legitimately needs to rebuild every
+  // animation frame during playback, since position is re-interpolated then.
+  const aircraftLayer = useMemo(() => {
+    if (!aircraft || aircraft.length === 0) return null
+    const positioned = aircraft.filter(a => a.lat != null && a.lon != null)
 
-      result.push(
-        new ScatterplotLayer({
-          id: "aircraft",
-          data: positioned,
-          getPosition: d => [d.lon, d.lat],
-          getRadius: 6000,
-          radiusMinPixels: 6,
-          radiusMaxPixels: 14,
-          getFillColor: d => STATUS_COLOR[d.status] ?? [200, 200, 200],
-          pickable: true,
-          onClick: (info) => {
-            console.log("clicked:", info.object)
-            if (info.object) {
-              onAircraftClick(info.object)
-            }
-          },
-          updateTriggers: {
-            getFillColor: [aircraft],
-          },
-        })
-      )
-    }
+    return new ScatterplotLayer({
+      id: "aircraft",
+      data: positioned,
+      getPosition: d => [d.lon, d.lat],
+      getRadius: 6000,
+      radiusMinPixels: 6,
+      radiusMaxPixels: 14,
+      getFillColor: d => STATUS_COLOR[d.status] ?? [200, 200, 200],
+      pickable: true,
+      onClick: (info) => {
+        console.log("clicked:", info.object)
+        if (info.object) {
+          onAircraftClick(info.object)
+        }
+      },
+      updateTriggers: {
+        // colorRevision, not `aircraft` -- see comment on the colorRevision
+        // param above.
+        getFillColor: [colorRevision],
+      },
+    })
+  }, [aircraft, onAircraftClick, colorRevision])
 
-    return result
-  }, [routes, airports, aircraft, onAircraftClick, routeLimit, theme, selectedAirport])
+  const layers = useMemo(
+    () => (aircraftLayer ? [...staticLayers, aircraftLayer] : staticLayers),
+    [staticLayers, aircraftLayer]
+  )
 
   return (
     <div style={{ width: "100%", height, position: "relative" }}>
@@ -189,4 +233,8 @@ function MapView({ aircraft, onAircraftClick, height = "100vh", selectedAirport 
   )
 }
 
-export default MapView
+// memo(): during playback `aircraft`/`colorRevision` genuinely change every
+// frame so this still re-renders then, same as before -- but it stops
+// wasted re-renders from unrelated Live() state changes while paused (e.g.
+// typing in search, opening the tutorial modal).
+export default memo(MapView)

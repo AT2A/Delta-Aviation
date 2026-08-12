@@ -6,4 +6,6 @@ __pycache__/
 venv/
 node_modules/
 analysis/experiments/
-logs/*.log
+logs/
+.claude/
+_archive/

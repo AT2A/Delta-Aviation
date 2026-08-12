@@ -11,8 +11,8 @@ import multiprocessing as mp
 import queue
 
 
-# Generous: init_worker() (backend/solver_worker.py) reloads a full graph
-# pickle and rebuilds worker-local state, taking multiple seconds even on success.
+# Generous: init_worker() (backend/solver_worker.py) reloads the lean data
+# artifacts and rebuilds worker-local state, taking a few seconds even on success.
 WORKER_READY_TIMEOUT_SECONDS = 120
 
 

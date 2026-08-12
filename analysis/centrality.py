@@ -18,6 +18,23 @@ def build_weighted_graph(G):
     return G_weighted
 
 
+def build_weighted_graph_from_frame(legs_frame, node_attrs):
+    """Same output shape as build_weighted_graph(G), built from a flat
+    per-flight DataFrame and a small {code: {city, lat, lon}} dict instead
+    of a full per-flight graph object.
+    """
+    route_counts = legs_frame.groupby(['Origin', 'Dest'], observed=True).size()
+
+    G_weighted = nx.DiGraph()
+    for code, attrs in node_attrs.items():
+        G_weighted.add_node(code, **attrs)
+
+    for (u, v), count in route_counts.items():
+        G_weighted.add_edge(u, v, weight=int(count))
+
+    return G_weighted
+
+
 def compute_degree_centrality(G_weighted):
     n = G_weighted.number_of_nodes()
     return {

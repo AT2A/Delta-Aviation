@@ -1,25 +1,26 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react"
 import MapView from "../components/MapView"
-import AirportAutocomplete from "../components/AirportAutocomplete"
+import LiveSidebar from "../components/LiveSidebar"
 import { useTheme } from "../ThemeContext"
 
 const DEFAULT_MINUTES = 8 * 60 // 08:00
 const MAX_MINUTES = 1439
 // Playback speed: simulated minutes advanced per real millisecond while
-// playing (unchanged from the original 5-min-per-500ms rate) -- now applied
+// playing (unchanged from the original 5-min-per-500ms rate) -- applied
 // continuously via requestAnimationFrame instead of a fixed-step interval,
-// so dot movement is smooth regardless of how often we poll the backend.
+// so dot movement is smooth regardless of frame timing.
 const STEP_MINUTES = 5
 const TICK_MS = 500
 const PLAYBACK_RATE_MIN_PER_MS = STEP_MINUTES / TICK_MS
-// How often we ask the backend for a fresh snapshot while playing. Kept
-// well above typical /state response time; combined with fetchInFlightRef
-// below, we never have more than one /state request in flight at once.
-const STATE_REFRESH_MS = 1000
+// The full day's schedule is fetched once per replayDate (see the
+// scheduleByTail effect) -- there's no backend poll left to rate-limit.
+// This only paces the local searchResults snapshot (see searchSnapshot)
+// so LiveSidebar isn't handed a new array reference every animation frame.
+const SEARCH_SNAPSHOT_REFRESH_MS = 1000
 
 // Mirrors backend/analysis/geo.py's great_circle_interpolate exactly, so
 // the frontend can smoothly re-derive an in_flight aircraft's position for
-// any moment between /state polls instead of only at fetched keyframes.
+// any moment, not just at fetched keyframes.
 function greatCircleInterpolate(lat1, lon1, lat2, lon2, frac) {
   const toRad = d => (d * Math.PI) / 180
   const toDeg = r => (r * 180) / Math.PI
@@ -36,6 +37,52 @@ function greatCircleInterpolate(lat1, lon1, lat2, lon2, frac) {
   return [toDeg(Math.atan2(z, Math.sqrt(x * x + y * y))), toDeg(Math.atan2(y, x))]
 }
 
+// Statuses where the aircraft hasn't left `origin` yet -- position it there.
+// taxiing_in/parked position at `destination`; in_flight is interpolated
+// separately. Mirrors backend/main.py's ORIGIN_STATUSES exactly.
+const ORIGIN_STATUSES = new Set(["not_yet_started", "taxiing_out", "cancelled"])
+
+// The three functions below port analysis/queries.py's find_owning_leg /
+// classify_aircraft_status / get_aircraft_state to JS field-for-field, so
+// the frontend can derive any aircraft's status at any instant from the
+// once-per-date /schedule fetch instead of polling /state. Operate on
+// epoch-ms (pre-parsed once when the schedule arrives, not per frame) --
+// same principle as greatCircleInterpolate's inputs.
+function findOwningLeg(legs, queryMs) {
+  let owning = null
+  for (const leg of legs) {
+    if (leg.depMs != null && leg.depMs <= queryMs) owning = leg
+    else break
+  }
+  return owning
+}
+
+function classifyStatus(leg, queryMs) {
+  if (leg.cancelled) return "cancelled"
+  if (leg.arrMs == null) return "in_flight"
+  if (leg.wheelsOffMs != null && queryMs < leg.wheelsOffMs) return "taxiing_out"
+  if (leg.wheelsOnMs != null && queryMs < leg.wheelsOnMs) return "in_flight"
+  if (queryMs < leg.arrMs) return "taxiing_in"
+  return "parked"
+}
+
+function getAircraftState(legs, queryMs) {
+  if (!legs.length) {
+    return { status: "not_operating", origin: null, destination: null, wheelsOffMs: null, wheelsOnMs: null }
+  }
+  const owning = findOwningLeg(legs, queryMs)
+  if (!owning) {
+    return { status: "not_yet_started", origin: legs[0].origin, destination: null, wheelsOffMs: null, wheelsOnMs: null }
+  }
+  return {
+    status: classifyStatus(owning, queryMs),
+    origin: owning.origin,
+    destination: owning.dest,
+    wheelsOffMs: owning.wheelsOffMs,
+    wheelsOnMs: owning.wheelsOnMs,
+  }
+}
+
 // Local midnight of `dateStr` plus `minutes` (fractional minutes allowed),
 // matching how wheels_off/wheels_on ISO strings are parsed by `new Date`.
 function minutesToDate(dateStr, minutes) {
@@ -48,73 +95,8 @@ function hhmmToMinutes(hhmm) {
   return h * 60 + m
 }
 
-// Curated flights where Feature 1/2 produce clear, illustrative results --
-// found by sampling real /disrupt and /disrupt/aircraft-down output across
-// many tail/date combinations, not fabricated. Jumping to one of these
-// loads the real date/time and selects the real aircraft; every number
-// shown afterward still comes from a live backend call.
-const DEMO_EXAMPLES = [
-  {
-    tail_number: "N372DN",
-    date: "2025-07-30",
-    time: "11:30",
-    // The leg being evaluated for cancellation -- not necessarily where the
-    // aircraft physically is at `time` (it's mid-rotation on an earlier leg
-    // then), same as how a real dispatcher would decide "as of now, what if
-    // we cancelled this upcoming leg". Overrides the /state snapshot's
-    // origin/destination once selected -- see the pendingDemoExample effect.
-    origin: "ATL",
-    destination: "LGA",
-    feature: "cancel",
-    label: "N372DN · ATL→LGA",
-    blurb: "94.7% improvement, 3 legs saved. Switch to \"Protect major flights\" and watch the Recommended pick change.",
-  },
-  {
-    tail_number: "N935AT",
-    date: "2025-05-01",
-    time: "07:10",
-    origin: "HSV",
-    destination: "ATL",
-    feature: "cancel",
-    label: "N935AT · HSV→ATL",
-    blurb: "98.4% improvement, 5 legs saved. The top candidate's disruption score is a fraction of the runner-ups'.",
-  },
-  {
-    tail_number: "N992AT",
-    date: "2025-01-01",
-    time: "08:51",
-    feature: "ground",
-    label: "N992AT",
-    blurb: "4 orphaned legs — Greedy covers 3, Optimal covers all 4. Try switching solvers.",
-  },
-  {
-    tail_number: "N899AT",
-    date: "2025-01-01",
-    time: "10:18",
-    feature: "ground",
-    label: "N899AT",
-    blurb: "3 orphaned legs — Greedy covers 2, Optimal covers all 3.",
-  },
-  {
-    tail_number: "N928AT",
-    date: "2025-01-01",
-    time: "07:14",
-    feature: "ground",
-    label: "N928AT",
-    blurb: "5 orphaned legs, the biggest gap found — Greedy covers 3, Optimal recovers all 5.",
-  },
-]
-
 // Aircraft not currently in flight -- i.e. plausible to ground right now.
 const ELIGIBLE_STATUSES = ["taxiing_out", "taxiing_in", "parked", "not_yet_started"]
-
-const RANKING_MODES = [
-  { value: "minimize_this_flight_delay", label: "Minimize this flight's delay" },
-  { value: "minimize_total_delay", label: "Minimize total propagated delay" },
-  { value: "protect_other_flights", label: "Protect other flights" },
-  { value: "protect_major_flights", label: "Protect major flights" },
-  { value: "all_factors_combined", label: "All factors combined" },
-]
 
 // Mirrors MapView.jsx's internal STATUS_COLOR map (MapView.jsx:14-22).
 // Keep these two lists in sync manually if aircraft statuses/colors change.
@@ -163,7 +145,10 @@ function Live() {
   // aircraft positions and the time readout move smoothly instead of
   // jumping once per backend poll.
   const [displayMinutes, setDisplayMinutes] = useState(DEFAULT_MINUTES)
-  const [aircraftState, setAircraftState] = useState(null)
+  // {[tail_number]: [{origin, dest, depMs, wheelsOffMs, wheelsOnMs, arrMs, cancelled}, ...]}
+  // for the current replayDate, fetched once (see the schedule-fetch effect)
+  // instead of polled -- see findOwningLeg/classifyStatus/getAircraftState.
+  const [scheduleByTail, setScheduleByTail] = useState(null)
   const [playing, setPlaying] = useState(false)
   const [replayDate, setReplayDate] = useState("2025-06-12")
   const [selectedAircraft, setSelectedAircraft] = useState(null)
@@ -176,13 +161,31 @@ function Live() {
   const [isDisrupting, setIsDisrupting] = useState(false)
   const [demoMode, setDemoMode] = useState(false)
   const [tutorialOpen, setTutorialOpen] = useState(false)
-  // The DEMO_EXAMPLES entry we're waiting on a fresh /state snapshot for.
+  // The DEMO_EXAMPLES entry we're waiting on the schedule-derived aircraft
+  // list for.
   const [pendingDemoExample, setPendingDemoExample] = useState(null)
-  const stateRequestId = useRef(0)
-  const fetchInFlightRef = useRef(false)
+  const scheduleRequestId = useRef(0)
+  // Updated every render (see the `visibleMinutesRef.current = visibleMinutes`
+  // assignment below) and read at call time by handleCancel/handleModeChange/
+  // handleGroundAircraft -- NOT a useCallback dependency, since visibleMinutes
+  // changes every animation frame while playing and adding it as a dep would
+  // recreate these handlers every frame, defeating LiveSidebar's React.memo.
+  const visibleMinutesRef = useRef(DEFAULT_MINUTES)
   const [airportOptions, setAirportOptions] = useState([])
+  // Lower-frequency copy of renderedAircraft used only by searchResults --
+  // see the searchSnapshot effect below for why this needs to exist
+  // separately from renderedAircraft (which changes every animation frame).
+  const [searchSnapshot, setSearchSnapshot] = useState(null)
+  // searchOrigin/searchDest are the committed filter values (only set on
+  // Enter or clicking a suggestion) -- originInput/destInput are the raw
+  // typed text, which only drives the autocomplete suggestion list. Without
+  // this split, every keystroke re-filtered all ~1015 aircraft against a
+  // half-typed code (e.g. "J", "JF") and flickered the match list before the
+  // user had actually picked an airport.
   const [searchOrigin, setSearchOrigin] = useState("")
   const [searchDest, setSearchDest] = useState("")
+  const [originInput, setOriginInput] = useState("")
+  const [destInput, setDestInput] = useState("")
   const [eligibleOnly, setEligibleOnly] = useState(false)
 
   useEffect(() => {
@@ -191,39 +194,33 @@ function Live() {
       .then(data => setAirportOptions(data.airports))
   }, [])
 
-  // Once the /state fetch triggered by goToDemoExample resolves, select the
-  // real aircraft object from that snapshot -- same as clicking it on the
-  // map -- but keep the example's specific origin/destination (the leg
-  // being evaluated), since that can differ from wherever the aircraft
-  // physically is at that exact query time.
+  // The whole day's schedule is known in advance (this is a replay of
+  // historical data, not live telemetry), so fetch it once per replayDate
+  // instead of polling for a snapshot at the current instant every second --
+  // findOwningLeg/classifyStatus/getAircraftState (above) then derive any
+  // aircraft's status/position at any instant purely client-side, with zero
+  // per-frame network dependency and zero status-transition latency.
   useEffect(() => {
-    if (!pendingDemoExample || !aircraftState) return
-    const match = aircraftState.find(a => a.tail_number === pendingDemoExample.tail_number)
-    if (match) {
-      setSelectedAircraft(
-        pendingDemoExample.origin
-          ? { ...match, origin: pendingDemoExample.origin, destination: pendingDemoExample.destination }
-          : match
-      )
-      setPendingDemoExample(null)
-    }
-  }, [aircraftState, pendingDemoExample])
-
-  useEffect(() => {
-    const requestId = ++stateRequestId.current
-    fetchInFlightRef.current = true
-    fetch(`/state?date=${replayDate}&time=${minutesToHHMM(committedMinutes)}`)
+    const requestId = ++scheduleRequestId.current
+    fetch(`/schedule?date=${replayDate}`)
       .then(res => res.json())
       .then(data => {
-        // Ignore responses to a request that's no longer the latest one --
-        // ordering can still occasionally shuffle even at the reduced
-        // polling rate below.
-        if (requestId === stateRequestId.current) {
-          setAircraftState(data.aircraft)
+        if (requestId !== scheduleRequestId.current) return
+        const byTail = {}
+        for (const t of data.tails) {
+          byTail[t.tail_number] = t.legs.map(leg => ({
+            origin: leg.origin,
+            dest: leg.dest,
+            depMs: leg.dep ? new Date(leg.dep).getTime() : null,
+            wheelsOffMs: leg.wheels_off ? new Date(leg.wheels_off).getTime() : null,
+            wheelsOnMs: leg.wheels_on ? new Date(leg.wheels_on).getTime() : null,
+            arrMs: leg.arr ? new Date(leg.arr).getTime() : null,
+            cancelled: leg.cancelled,
+          }))
         }
+        setScheduleByTail(byTail)
       })
-      .finally(() => { fetchInFlightRef.current = false })
-  }, [committedMinutes, replayDate])
+  }, [replayDate])
 
   // Smooth clock: advances displayMinutes every animation frame based on
   // real elapsed time, independent of network/backend speed.
@@ -252,24 +249,6 @@ function Live() {
 
     raf = requestAnimationFrame(frame)
     return () => cancelAnimationFrame(raf)
-  }, [playing])
-
-  // Periodically refresh the backend snapshot while playing, skipping a
-  // tick entirely if the previous /state request hasn't resolved yet --
-  // this is what prevents requests from backing up and causing the
-  // "nothing moves, then jumps" stall.
-  useEffect(() => {
-    if (!playing) return
-
-    const interval = setInterval(() => {
-      if (fetchInFlightRef.current) return
-      setDisplayMinutes(current => {
-        setCommittedMinutes(Math.min(Math.round(current), MAX_MINUTES))
-        return current
-      })
-    }, STATE_REFRESH_MS)
-
-    return () => clearInterval(interval)
   }, [playing])
 
   // While paused/scrubbing, displayMinutes should exactly mirror the
@@ -302,18 +281,22 @@ function Live() {
     setAircraftDownResult(null)
   }, [])
 
-  const closePanel = () => {
+  // Stable references (useState setters are guaranteed stable) -- passed to
+  // memo()-wrapped LiveSidebar/AirportAutocomplete, so a fresh closure every
+  // render would silently defeat the memo.
+  const closePanel = useCallback(() => {
     setSelectedAircraft(null)
     setDisruptResult(null)
     setDisruptError(null)
     setAircraftDownResult(null)
-  }
+  }, [])
 
   // Aircraft that haven't started their first leg yet have no destination
-  // (see /state -- only `origin` is populated), so there's nothing to cancel.
+  // (see getAircraftState -- only `origin` is populated), so there's
+  // nothing to cancel.
   const canCancel = selectedAircraft?.destination != null
 
-  const handleCancel = () => {
+  const handleCancel = useCallback(() => {
     if (isDisrupting || !canCancel) return
     setIsDisrupting(true)
     fetch("/disrupt", {
@@ -322,7 +305,7 @@ function Live() {
       body: JSON.stringify({
         tail_number: selectedAircraft.tail_number,
         date: replayDate,
-        time: minutesToHHMM(committedMinutes),
+        time: minutesToHHMM(Math.round(visibleMinutesRef.current)),
         origin: selectedAircraft.origin,
         destination: selectedAircraft.destination,
         mode: selectedMode,
@@ -339,12 +322,12 @@ function Live() {
         }
       })
       .finally(() => setIsDisrupting(false))
-  }
+  }, [isDisrupting, canCancel, selectedAircraft, replayDate, selectedMode])
 
   // Changing mode after a result already exists re-runs the same disruption
   // under the new weighting -- simplest is to just re-fetch automatically,
   // consistent with how the rest of this file re-fetches on state change.
-  const handleModeChange = (e) => {
+  const handleModeChange = useCallback((e) => {
     if (isDisrupting) return
     const newMode = e.target.value
     setSelectedMode(newMode)
@@ -356,7 +339,7 @@ function Live() {
         body: JSON.stringify({
           tail_number: selectedAircraft.tail_number,
           date: replayDate,
-          time: minutesToHHMM(committedMinutes),
+          time: minutesToHHMM(Math.round(visibleMinutesRef.current)),
           origin: selectedAircraft.origin,
           destination: selectedAircraft.destination,
           mode: newMode,
@@ -374,9 +357,9 @@ function Live() {
         })
         .finally(() => setIsDisrupting(false))
     }
-  }
+  }, [isDisrupting, disruptResult, selectedAircraft, replayDate])
 
-  const handleGroundAircraft = () => {
+  const handleGroundAircraft = useCallback(() => {
     if (isGrounding) return
     setAircraftDownResult(null)
     setIsGrounding(true)
@@ -386,7 +369,7 @@ function Live() {
       body: JSON.stringify({
         tail_number: selectedAircraft.tail_number,
         date: replayDate,
-        time: minutesToHHMM(committedMinutes),
+        time: minutesToHHMM(Math.round(visibleMinutesRef.current)),
         mode: selectedMode,
         solver: solver,
       }),
@@ -394,15 +377,13 @@ function Live() {
       .then(res => res.json())
       .then(data => setAircraftDownResult(data))
       .finally(() => setIsGrounding(false))
-  }
-
-  const formatLegs = (legs) => legs.map(([u, v]) => `${u}→${v}`).join(", ")
+  }, [isGrounding, selectedAircraft, replayDate, selectedMode, solver])
 
   const toggleDemoMode = () => setDemoMode(d => !d)
   const openTutorial = () => setTutorialOpen(true)
   const closeTutorial = () => setTutorialOpen(false)
 
-  const goToDemoExample = (example) => {
+  const goToDemoExample = useCallback((example) => {
     setPlaying(false)
     setSelectedAircraft(null)
     setDisruptResult(null)
@@ -416,40 +397,136 @@ function Live() {
     setPendingDemoExample(example)
     setReplayDate(example.date)
     setCommittedMinutes(minutes)
-  }
+  }, [])
+
+  const toggleEligibleOnly = useCallback(() => setEligibleOnly(v => !v), [])
+
+  const handleOriginChangeText = useCallback((t) => {
+    const upper = t.toUpperCase()
+    setOriginInput(upper)
+    if (!upper) setSearchOrigin("")
+  }, [])
+  const handleOriginSelect = useCallback((code) => {
+    setOriginInput(code)
+    setSearchOrigin(code)
+  }, [])
+  const handleDestChangeText = useCallback((t) => {
+    const upper = t.toUpperCase()
+    setDestInput(upper)
+    if (!upper) setSearchDest("")
+  }, [])
+  const handleDestSelect = useCallback((code) => {
+    setDestInput(code)
+    setSearchDest(code)
+  }, [])
 
   // What's actually shown: driven by the smooth clock while playing, by the
   // slider's raw drag position otherwise.
   const visibleMinutes = playing ? displayMinutes : draftMinutes
+  visibleMinutesRef.current = visibleMinutes
 
-  // Re-derive in_flight aircraft positions for the exact current instant
-  // using the same great-circle math the backend used to produce
-  // wheels_off/wheels_on/origin/dest coords -- everything else (parked,
-  // taxiing, etc.) just keeps its last-fetched static position.
+  // {[Origin]: [lat, lon]}, built once from the already-fetched airport
+  // list (it already carries coords for the autocomplete) so position
+  // resolution below doesn't need its own network round-trip.
+  const airportCoords = useMemo(() => {
+    const coords = {}
+    for (const a of airportOptions) coords[a.Origin] = [a.lat, a.lon]
+    return coords
+  }, [airportOptions])
+
+  // Derives every aircraft's status + position at the exact current instant
+  // from the once-per-date schedule, mirroring backend/main.py's /state
+  // loop (main.py:288-341) field-for-field: getAircraftState for
+  // status/origin/destination, then the same in_flight-interpolate-else-
+  // position-at-airport rule. Runs every frame while playing (status can
+  // change any frame), but each tail's own leg list is tiny (a handful of
+  // legs) and was pre-parsed to epoch-ms once when the schedule arrived --
+  // no per-frame Date parsing or network involved.
   const renderedAircraft = useMemo(() => {
-    if (!aircraftState) return null
-    const queryDate = minutesToDate(replayDate, visibleMinutes)
-    return aircraftState.map(a => {
-      if (a.status !== "in_flight" || !a.wheels_off || !a.wheels_on) return a
-      const wheelsOff = new Date(a.wheels_off)
-      const wheelsOn = new Date(a.wheels_on)
-      const duration = wheelsOn - wheelsOff
-      if (!(duration > 0)) return a
-      const frac = Math.max(0, Math.min(1, (queryDate - wheelsOff) / duration))
-      const [lat, lon] = greatCircleInterpolate(a.origin_lat, a.origin_lon, a.dest_lat, a.dest_lon, frac)
-      return { ...a, lat, lon }
-    })
-  }, [aircraftState, replayDate, visibleMinutes])
+    if (!scheduleByTail) return null
+    const queryMs = minutesToDate(replayDate, visibleMinutes).getTime()
+    const results = []
+    for (const tailNumber in scheduleByTail) {
+      const legs = scheduleByTail[tailNumber]
+      const { status, origin, destination, wheelsOffMs, wheelsOnMs } = getAircraftState(legs, queryMs)
+
+      let lat = null, lon = null
+      if (status === "in_flight") {
+        const hasTiming = wheelsOffMs != null && wheelsOnMs != null && wheelsOnMs > wheelsOffMs
+        const originCoord = airportCoords[origin]
+        const destCoord = airportCoords[destination]
+        if (hasTiming && originCoord && destCoord) {
+          const frac = Math.max(0, Math.min(1, (queryMs - wheelsOffMs) / (wheelsOnMs - wheelsOffMs)))
+          ;[lat, lon] = greatCircleInterpolate(originCoord[0], originCoord[1], destCoord[0], destCoord[1], frac)
+        } else if (destCoord) {
+          [lat, lon] = destCoord
+        }
+      } else {
+        const positionCode = ORIGIN_STATUSES.has(status) ? origin : destination
+        const coord = airportCoords[positionCode]
+        if (coord) [lat, lon] = coord
+      }
+
+      results.push({ tail_number: tailNumber, status, origin, destination, lat, lon })
+    }
+    return results
+  }, [scheduleByTail, airportCoords, replayDate, visibleMinutes])
+
+  // Updated every render so the interval below always reads the CURRENT
+  // renderedAircraft, not whatever it closed over when the interval was
+  // created -- a plain closure over renderedAircraft would capture one
+  // stale snapshot forever, since this effect only re-runs on `playing`
+  // changes, not every frame.
+  const renderedAircraftRef = useRef(null)
+  renderedAircraftRef.current = renderedAircraft
+
+  // searchResults reads searchSnapshot (refreshed at most once a second, see
+  // below), not renderedAircraft directly -- renderedAircraft gets a new
+  // array reference every animation frame while playing, and searchResults
+  // is a prop into memo()-wrapped LiveSidebar, so riding renderedAircraft
+  // directly would hand it a "changed" prop every frame and defeat the
+  // memo, the same class of bug the original searchResults rebase (earlier
+  // this session) fixed for the old poll-driven aircraftState.
+  useEffect(() => {
+    setSearchSnapshot(renderedAircraftRef.current)
+  }, [scheduleByTail, replayDate])
+
+  useEffect(() => {
+    if (!playing) {
+      setSearchSnapshot(renderedAircraftRef.current)
+      return
+    }
+    const interval = setInterval(() => setSearchSnapshot(renderedAircraftRef.current), SEARCH_SNAPSHOT_REFRESH_MS)
+    return () => clearInterval(interval)
+  }, [playing])
+
+  // Once the schedule-derived aircraft list resolves for the demo example's
+  // date/time, select the real aircraft object -- same as clicking it on
+  // the map -- but keep the example's specific origin/destination (the leg
+  // being evaluated), since that can differ from wherever the aircraft
+  // physically is at that exact query time.
+  useEffect(() => {
+    if (!pendingDemoExample || !renderedAircraft) return
+    const match = renderedAircraft.find(a => a.tail_number === pendingDemoExample.tail_number)
+    if (match) {
+      setSelectedAircraft(
+        pendingDemoExample.origin
+          ? { ...match, origin: pendingDemoExample.origin, destination: pendingDemoExample.destination }
+          : match
+      )
+      setPendingDemoExample(null)
+    }
+  }, [renderedAircraft, pendingDemoExample])
 
   const searchActive = Boolean(searchOrigin || searchDest || eligibleOnly)
   const searchResults = useMemo(() => {
-    if (!searchActive || !renderedAircraft) return []
-    return renderedAircraft.filter(a =>
+    if (!searchActive || !searchSnapshot) return []
+    return searchSnapshot.filter(a =>
       (!searchOrigin || a.origin === searchOrigin) &&
       (!searchDest || a.destination === searchDest) &&
       (!eligibleOnly || ELIGIBLE_STATUSES.includes(a.status))
     )
-  }, [renderedAircraft, searchOrigin, searchDest, eligibleOnly, searchActive])
+  }, [searchSnapshot, searchOrigin, searchDest, eligibleOnly, searchActive])
 
   return (
     <div style={{ display: "flex", flexDirection: "column", width: "100vw", height: "calc(100vh - 64px)" }}>
@@ -609,7 +686,7 @@ function Live() {
 
       <div style={{ display: "flex", flex: 1, minHeight: 0, position: "relative" }}>
         <div style={{ flex: 1, position: "relative" }}>
-          {aircraftState === null && (
+          {(scheduleByTail === null || airportOptions.length === 0) && (
             <div
               style={{
                 position: "absolute",
@@ -631,6 +708,7 @@ function Live() {
             aircraft={renderedAircraft ?? []}
             onAircraftClick={handleAircraftClick}
             height="100%"
+            colorRevision={searchSnapshot}
           />
 
           <div
@@ -658,439 +736,36 @@ function Live() {
           </div>
         </div>
 
-        <div
-          style={{
-            width: "360px",
-            flexShrink: 0,
-            height: "100%",
-            background: theme.cardBg,
-            borderLeft: `1px solid ${theme.border}`,
-            padding: "20px",
-            overflowY: "auto",
-            boxSizing: "border-box",
-            fontFamily: "'Inter', system-ui, sans-serif",
-            color: theme.textPrimary,
-          }}
-        >
-          {selectedAircraft ? (
-            <>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
-                <span style={{ fontFamily: "'JetBrains Mono', monospace", fontWeight: 700, fontSize: "20px", color: theme.textPrimary }}>
-                  {selectedAircraft.tail_number}
-                </span>
-                <button
-                  onClick={closePanel}
-                  style={{ border: "none", background: "none", cursor: "pointer", fontSize: "18px", lineHeight: 1, color: theme.textMuted, padding: "2px 4px" }}
-                >
-                  ×
-                </button>
-              </div>
-
-              <div style={{ fontSize: "13px", color: theme.textSecondary, marginTop: "6px" }}>
-                {selectedAircraft.origin} → {selectedAircraft.destination} · {selectedAircraft.status}
-              </div>
-
-              <div style={{ marginTop: "16px" }}>
-                <label style={{ fontSize: "11px", fontWeight: 700, color: theme.textSecondary, textTransform: "uppercase", letterSpacing: "0.04em" }}>
-                  Ranking mode
-                </label>
-                <select
-                  value={selectedMode}
-                  onChange={handleModeChange}
-                  disabled={isDisrupting}
-                  style={{
-                    width: "100%",
-                    marginTop: "6px",
-                    padding: "9px 10px",
-                    fontSize: "13px",
-                    border: `1px solid ${theme.border}`,
-                    borderRadius: "8px",
-                    fontFamily: "'Inter', system-ui, sans-serif",
-                    color: theme.textPrimary,
-                    background: theme.cardBg,
-                    opacity: isDisrupting ? 0.6 : 1,
-                    cursor: isDisrupting ? "default" : "pointer",
-                  }}
-                >
-                  {RANKING_MODES.map(m => (
-                    <option key={m.value} value={m.value}>{m.label}</option>
-                  ))}
-                </select>
-              </div>
-
-              <button
-                onClick={handleCancel}
-                disabled={isDisrupting || !canCancel}
-                style={{
-                  marginTop: "16px",
-                  width: "100%",
-                  padding: "10px",
-                  border: `1px solid ${theme.border}`,
-                  borderRadius: "8px",
-                  background: theme.cardBg,
-                  color: theme.textPrimary,
-                  fontSize: "13px",
-                  fontWeight: 600,
-                  fontFamily: "'Inter', system-ui, sans-serif",
-                  opacity: isDisrupting || !canCancel ? 0.6 : 1,
-                  cursor: isDisrupting || !canCancel ? "default" : "pointer",
-                }}
-              >
-                {isDisrupting
-                  ? "Working..."
-                  : canCancel
-                    ? "Cancel this flight"
-                    : "Not yet departed — nothing to cancel"}
-              </button>
-
-              <div style={{ marginTop: "20px" }}>
-                <label style={{ fontSize: "11px", fontWeight: 700, color: theme.textSecondary, textTransform: "uppercase", letterSpacing: "0.04em" }}>
-                  Solver
-                </label>
-                <select
-                  value={solver}
-                  onChange={e => setSolver(e.target.value)}
-                  disabled={isGrounding}
-                  style={{
-                    width: "100%",
-                    marginTop: "6px",
-                    padding: "9px 10px",
-                    fontSize: "13px",
-                    border: `1px solid ${theme.border}`,
-                    borderRadius: "8px",
-                    fontFamily: "'Inter', system-ui, sans-serif",
-                    color: theme.textPrimary,
-                    background: theme.cardBg,
-                    opacity: isGrounding ? 0.6 : 1,
-                    cursor: isGrounding ? "default" : "pointer",
-                  }}
-                >
-                  <option value="greedy">Greedy (fast)</option>
-                  <option value="optimal">Optimal (slower, best answer)</option>
-                </select>
-              </div>
-
-              <button
-                onClick={handleGroundAircraft}
-                disabled={isGrounding}
-                style={{
-                  marginTop: "8px",
-                  width: "100%",
-                  padding: "10px",
-                  border: `1px solid ${theme.accentColor}`,
-                  borderRadius: "8px",
-                  background: theme.cardBg,
-                  color: theme.accentColor,
-                  fontSize: "13px",
-                  fontWeight: 600,
-                  fontFamily: "'Inter', system-ui, sans-serif",
-                  opacity: isGrounding ? 0.6 : 1,
-                  cursor: isGrounding ? "default" : "pointer",
-                }}
-              >
-                {isGrounding ? "Grounding..." : "Ground this aircraft"}
-              </button>
-
-              {aircraftDownResult && (
-                <div style={{ marginTop: "20px" }}>
-                  <div
-                    style={{
-                      background: theme.successBg,
-                      border: `1px solid ${theme.successBorder}`,
-                      borderRadius: "8px",
-                      padding: "14px",
-                    }}
-                  >
-                    <div style={{ fontSize: "11px", fontWeight: 700, color: theme.successNumber, textTransform: "uppercase", letterSpacing: "0.03em" }}>
-                      Recovery coverage · {aircraftDownResult.solver} solver
-                    </div>
-                    <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: "26px", fontWeight: 800, color: theme.successNumber, marginTop: "4px" }}>
-                      {aircraftDownResult.total_covered_legs} / {aircraftDownResult.total_orphaned_legs} legs covered
-                    </div>
-                    <div style={{ fontSize: "11px", color: theme.textSecondary, marginTop: "6px" }}>
-                      {aircraftDownResult.total_uncovered_legs} leg(s) uncovered · {aircraftDownResult.num_segments} segment(s) ·{" "}
-                      {aircraftDownResult.total_induced_delay_minutes.toFixed(0)} min total induced delay
-                    </div>
-                  </div>
-
-                  <h3 style={{ fontSize: "11px", fontWeight: 700, color: theme.textPrimary, textTransform: "uppercase", letterSpacing: "0.04em", marginTop: "20px", marginBottom: "10px" }}>
-                    Recovery segments
-                  </h3>
-
-                  {aircraftDownResult.segments.map((seg, i) => (
-                    seg.tail_number ? (
-                      <div
-                        key={i}
-                        style={{
-                          border: `1px solid ${theme.border}`,
-                          borderRadius: "8px",
-                          padding: "10px 12px",
-                          marginBottom: "8px",
-                          background: theme.cardBg,
-                        }}
-                      >
-                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                          <span style={{ fontFamily: "'JetBrains Mono', monospace", fontWeight: 700, fontSize: "13px", color: theme.textPrimary }}>
-                            {seg.tail_number}
-                          </span>
-                        </div>
-                        <div style={{ fontSize: "11px", color: theme.textSecondary, marginTop: "4px" }}>
-                          {formatLegs(seg.legs_covered)}
-                        </div>
-                        <div style={{ fontSize: "11px", color: theme.textSecondary, marginTop: "4px" }}>
-                          {seg.induced_delay_minutes != null ? `Delay: ${seg.induced_delay_minutes.toFixed(0)} min · ` : ""}
-                          {seg.score != null ? `Score: ${seg.score.toFixed(2)}` : ""}
-                        </div>
-                      </div>
-                    ) : (
-                      <div
-                        key={i}
-                        style={{
-                          border: `1px solid ${theme.dangerBorder}`,
-                          borderRadius: "8px",
-                          padding: "10px 12px",
-                          marginBottom: "8px",
-                          background: theme.dangerBg,
-                        }}
-                      >
-                        <div style={{ fontSize: "13px", fontWeight: 700, color: theme.dangerText }}>
-                          No substitute found for {formatLegs(seg.legs_covered)}
-                        </div>
-                      </div>
-                    )
-                  ))}
-                </div>
-              )}
-
-              {disruptError && (
-                <div
-                  style={{
-                    marginTop: "20px",
-                    border: `1px solid ${theme.dangerBorder}`,
-                    borderRadius: "8px",
-                    padding: "14px",
-                    background: theme.dangerBg,
-                  }}
-                >
-                  <div style={{ fontSize: "13px", fontWeight: 700, color: theme.dangerText }}>
-                    {typeof disruptError === "string" ? disruptError : "Failed to cancel this flight."}
-                  </div>
-                </div>
-              )}
-
-              {disruptResult && (
-                <div style={{ marginTop: "20px" }}>
-                  {/* Headline improvement number, with honest supporting detail underneath -- never collapsed into just the percentage alone. */}
-                  <div
-                    style={{
-                      background: theme.successBg,
-                      border: `1px solid ${theme.successBorder}`,
-                      borderRadius: "8px",
-                      padding: "14px",
-                    }}
-                  >
-                    <div style={{ fontSize: "11px", fontWeight: 700, color: theme.successNumber, textTransform: "uppercase", letterSpacing: "0.03em" }}>
-                      Network disruption avoided
-                    </div>
-                    <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: "26px", fontWeight: 800, color: theme.successNumber, marginTop: "4px" }}>
-                      {disruptResult.improvement_pct !== null ? `${disruptResult.improvement_pct.toFixed(1)}%` : "—"}
-                    </div>
-                    <div style={{ fontSize: "11px", color: theme.textSecondary, marginTop: "6px" }}>
-                      {disruptResult.cancellations_avoided} leg(s) kept flying instead of cancelled ·{" "}
-                      {disruptResult.total_induced_delay_minutes !== null
-                        ? `${disruptResult.total_induced_delay_minutes.toFixed(0)} min induced delay`
-                        : "no substitute available"}
-                    </div>
-                    <div style={{ fontSize: "10px", color: theme.textMuted, marginTop: "6px" }}>
-                      Headline % assumes a 300 min modeling estimate per avoided cancellation — a stated assumption, not derived from data.
-                    </div>
-                  </div>
-
-                  <h3 style={{ fontSize: "11px", fontWeight: 700, color: theme.textPrimary, textTransform: "uppercase", letterSpacing: "0.04em", marginTop: "20px", marginBottom: "10px" }}>
-                    Ranked candidates
-                  </h3>
-
-                  {disruptResult.ranked_candidates.length === 0 && (
-                    <div style={{ fontSize: "13px", color: theme.textMuted }}>
-                      No viable substitute found — these legs would be cancelled.
-                    </div>
-                  )}
-
-                  {disruptResult.ranked_candidates.map((c, i) => (
-                    <div
-                      key={c.tail_number}
-                      style={{
-                        border: i === 0 ? `2px solid ${theme.accentColor}` : `1px solid ${theme.border}`,
-                        borderRadius: "8px",
-                        padding: "10px 12px",
-                        marginBottom: "8px",
-                        background: i === 0 ? "#eaefff" : theme.cardBg,
-                      }}
-                    >
-                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                        <span style={{ fontFamily: "'JetBrains Mono', monospace", fontWeight: 700, fontSize: "13px", color: i === 0 ? "#14181f" : theme.textPrimary }}>
-                          {c.tail_number}
-                        </span>
-                        {i === 0 && (
-                          <span
-                            style={{
-                              fontSize: "9.5px",
-                              fontWeight: 700,
-                              color: "#ffffff",
-                              background: theme.accentColor,
-                              borderRadius: "10px",
-                              padding: "2px 8px",
-                              textTransform: "uppercase",
-                              letterSpacing: "0.03em",
-                            }}
-                          >
-                            Recommended
-                          </span>
-                        )}
-                      </div>
-                      <div style={{ fontSize: "11px", color: i === 0 ? "#5b6472" : theme.textSecondary, marginTop: "4px" }}>
-                        Delay: {c.delay.toFixed(0)} min · Network disruption: {c.network_disruption.toFixed(0)} min · Connections at risk: {c.connecting_flights_missed}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </>
-          ) : (
-            <div>
-              <div style={{ fontSize: "11px", fontWeight: 700, color: theme.textSecondary, textTransform: "uppercase", letterSpacing: "0.04em", marginBottom: "10px" }}>
-                Find a flight
-              </div>
-              <AirportAutocomplete
-                value={searchOrigin}
-                onChangeText={t => setSearchOrigin(t.toUpperCase())}
-                onSelect={setSearchOrigin}
-                airports={airportOptions}
-                placeholder="Origin"
-                style={{ marginBottom: "6px" }}
-              />
-              <AirportAutocomplete
-                value={searchDest}
-                onChangeText={t => setSearchDest(t.toUpperCase())}
-                onSelect={setSearchDest}
-                airports={airportOptions}
-                placeholder="Destination"
-                style={{ marginBottom: "8px" }}
-              />
-              <button
-                onClick={() => setEligibleOnly(v => !v)}
-                style={{
-                  border: eligibleOnly ? `1px solid ${theme.successBorder}` : `1px solid ${theme.border}`,
-                  background: eligibleOnly ? theme.successBg : theme.cardBg,
-                  color: eligibleOnly ? theme.successNumber : theme.textSecondary,
-                  borderRadius: "20px",
-                  padding: "6px 14px",
-                  fontSize: "11.5px",
-                  fontWeight: 600,
-                  fontFamily: "'Inter', system-ui, sans-serif",
-                  cursor: "pointer",
-                }}
-              >
-                {eligibleOnly ? "● Eligible for disruption" : "Eligible for disruption"}
-              </button>
-
-              {searchActive ? (
-                <div style={{ marginTop: "16px" }}>
-                  <div style={{ fontSize: "10px", color: theme.textMuted, marginBottom: "8px" }}>
-                    {searchResults.length} match{searchResults.length === 1 ? "" : "es"} · reflects each aircraft's current leg only
-                  </div>
-                  {searchResults.length === 0 && (
-                    <div style={{ fontSize: "13px", color: theme.textMuted }}>
-                      No aircraft currently match.
-                    </div>
-                  )}
-                  {searchResults.map(a => (
-                    <div
-                      key={a.tail_number}
-                      onClick={() => handleAircraftClick(a)}
-                      style={{
-                        cursor: "pointer",
-                        border: `1px solid ${theme.border}`,
-                        borderRadius: "8px",
-                        padding: "10px 12px",
-                        marginBottom: "8px",
-                        background: theme.cardBg,
-                      }}
-                    >
-                      <span style={{ fontFamily: "'JetBrains Mono', monospace", fontWeight: 700, fontSize: "13px", color: theme.textPrimary }}>
-                        {a.tail_number}
-                      </span>
-                      <div style={{ fontSize: "11px", color: theme.textSecondary, marginTop: "4px" }}>
-                        {a.origin ?? "—"} → {a.destination ?? "—"} · {a.status}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              ) : demoMode ? (
-                <div style={{ marginTop: "16px" }}>
-              {DEMO_EXAMPLES.map(ex => (
-                <button
-                  key={ex.tail_number + ex.date + ex.time}
-                  onClick={() => goToDemoExample(ex)}
-                  style={{
-                    display: "block",
-                    width: "100%",
-                    textAlign: "left",
-                    border: `1px solid ${theme.border}`,
-                    borderRadius: "8px",
-                    padding: "10px 12px",
-                    marginBottom: "8px",
-                    background: theme.cardBg,
-                    cursor: "pointer",
-                    fontFamily: "'Inter', system-ui, sans-serif",
-                  }}
-                >
-                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                    <span style={{ fontFamily: "'JetBrains Mono', monospace", fontWeight: 700, fontSize: "13px", color: theme.textPrimary }}>
-                      {ex.label}
-                    </span>
-                    <span
-                      style={{
-                        fontSize: "9.5px",
-                        fontWeight: 700,
-                        color: ex.feature === "cancel" ? theme.accentColor : theme.successNumber,
-                        background: ex.feature === "cancel" ? "#eaefff" : theme.successBg,
-                        borderRadius: "10px",
-                        padding: "2px 8px",
-                        textTransform: "uppercase",
-                        letterSpacing: "0.03em",
-                      }}
-                    >
-                      {ex.feature === "cancel" ? "Cancel" : "Ground"}
-                    </span>
-                  </div>
-                  <div style={{ fontSize: "11px", color: theme.textSecondary, marginTop: "4px", lineHeight: 1.4 }}>
-                    {ex.blurb}
-                  </div>
-                </button>
-              ))}
-                </div>
-              ) : (
-                <div
-                  style={{
-                    marginTop: "24px",
-                    display: "flex",
-                    flexDirection: "column",
-                    alignItems: "center",
-                    textAlign: "center",
-                    gap: "10px",
-                    color: theme.textMuted,
-                  }}
-                >
-                  <div style={{ fontSize: "32px" }} aria-hidden="true">✈</div>
-                  <div style={{ fontSize: "12.5px", lineHeight: 1.5, maxWidth: "220px" }}>
-                    Select an aircraft on the map, or search above, to explore recovery options
-                  </div>
-                </div>
-              )}
-            </div>
-          )}
-        </div>
+        <LiveSidebar
+          selectedAircraft={selectedAircraft}
+          closePanel={closePanel}
+          selectedMode={selectedMode}
+          handleModeChange={handleModeChange}
+          isDisrupting={isDisrupting}
+          canCancel={canCancel}
+          handleCancel={handleCancel}
+          solver={solver}
+          setSolver={setSolver}
+          isGrounding={isGrounding}
+          handleGroundAircraft={handleGroundAircraft}
+          aircraftDownResult={aircraftDownResult}
+          disruptError={disruptError}
+          disruptResult={disruptResult}
+          demoMode={demoMode}
+          searchActive={searchActive}
+          searchResults={searchResults}
+          handleAircraftClick={handleAircraftClick}
+          originInput={originInput}
+          destInput={destInput}
+          onOriginChangeText={handleOriginChangeText}
+          onOriginSelect={handleOriginSelect}
+          onDestChangeText={handleDestChangeText}
+          onDestSelect={handleDestSelect}
+          airportOptions={airportOptions}
+          eligibleOnly={eligibleOnly}
+          toggleEligibleOnly={toggleEligibleOnly}
+          goToDemoExample={goToDemoExample}
+        />
       </div>
     </div>
   )

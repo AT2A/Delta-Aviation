@@ -1,12 +1,14 @@
-import pickle
 from pathlib import Path
 
-from analysis.queries import compute_route_delay_summary, build_flight_frame_from_graph
-from analysis.centrality import build_weighted_graph, compute_betweenness_centrality
+from analysis.queries import compute_route_delay_summary
+from analysis.centrality import build_weighted_graph_from_frame, compute_betweenness_centrality
+from analysis.data_loading import (
+    load_legs_frame, load_airport_nodes, build_legs_by_tail, build_flight_frame,
+    build_route_duration_table,
+)
 from analysis.disruption import (
     assign_recovery_segments,
     assign_recovery_segments_optimal,
-    _build_route_duration_table,
 )
 
 DATA_DIR = Path(__file__).parent.parent / "data"
@@ -18,40 +20,34 @@ def init_worker():
     """Worker-process initializer. Windows' 'spawn' start method shares no
     memory with the main process, so each worker rebuilds its own tables.
 
-    Rebuilds legs_by_tail locally from the graph pickle rather than passing
-    it through initargs -- pickling its ~1.27M per-leg dicts (~50s measured)
-    costs more than reloading the graph here. Builds the flight frame from
-    already-loaded graph edges (~2s) instead of re-parsing the CSV (~13.6s).
-    Reads the pickle bytes up front and calls pickle.loads() rather than
-    pickle.load(file) -- ~2.5-3x faster, measured.
+    Loads the lean legs_frame/airport_nodes artifacts (build_lean_artifacts.py)
+    rather than the full per-flight graph pickle -- unpickling that graph
+    alone measured ~4.4GB of real RSS per process, and every solver worker
+    paid that cost independently, making the app undeployable on any
+    reasonably sized host.
     """
-    with open(DATA_DIR / "delta_rotation_graph.pkl", "rb") as f:
-        graph_bytes = f.read()
-    G = pickle.loads(graph_bytes)
+    legs_frame = load_legs_frame()
+    airport_nodes = load_airport_nodes()
 
-    legs_by_tail = {}
-    for u, v, d in G.edges(data=True):
-        legs_by_tail.setdefault(d['tail_number'], []).append((u, v, d))
-    for tail in legs_by_tail:
-        legs_by_tail[tail].sort(key=lambda e: e[2]['crs_dep_dt'])
+    legs_by_tail = build_legs_by_tail(legs_frame)
 
-    df = build_flight_frame_from_graph(G)
+    df = build_flight_frame(legs_frame)
     route_table = compute_route_delay_summary(df)
 
-    G_weighted = build_weighted_graph(G)
+    G_weighted = build_weighted_graph_from_frame(legs_frame, airport_nodes)
     centrality_table = compute_betweenness_centrality(G_weighted)
 
     airport_coords = {
-        code: (data['lat'], data['lon'])
-        for code, data in G.nodes(data=True)
-        if data.get('lat') is not None and data.get('lon') is not None
+        code: (attrs['lat'], attrs['lon'])
+        for code, attrs in airport_nodes.items()
+        if attrs.get('lat') is not None and attrs.get('lon') is not None
     }
 
     _worker_state['legs_by_tail'] = legs_by_tail
     _worker_state['route_table'] = route_table
     _worker_state['centrality_table'] = centrality_table
     _worker_state['airport_coords'] = airport_coords
-    _worker_state['route_duration_table'] = _build_route_duration_table(legs_by_tail)
+    _worker_state['route_duration_table'] = build_route_duration_table(legs_frame)
 
 
 def solve(tail_number, date, time, mode, solver):
