@@ -227,6 +227,35 @@ Stated explicitly rather than silently worked around:
 
 ## Running locally
 
+The backend needs two data artifacts at startup — `data/legs_frame.pkl` and
+`data/airport_nodes.pkl` (~163MB combined) — that aren't in this repo. Get
+them one of two ways:
+
+**Quick start — download the prebuilt artifacts (recommended)**
+
+Download `legs_frame.pkl` and `airport_nodes.pkl` from the
+[latest release](https://github.com/AT2A/Delta-Aviation/releases/latest) and
+place both in `data/`.
+
+**From scratch — rebuild the pipeline yourself**
+
+1. Get the BTS TranStats On-Time Performance data (Reporting Carrier
+   On-Time Performance dataset,
+   [transtats.bts.gov](https://www.transtats.bts.gov/Fields.asp?gnoyr_VQ=FGJ)),
+   January 2025 – April 2026. BTS's download flow is per-month and manual;
+   there's no scripted bulk fetch. Filter to Delta domestic flights and save
+   as `data/delta_ontime_clean.csv` — this filtering/cleaning step is
+   currently done by hand and isn't captured in a tracked script.
+2. Download [OpenFlights `airports.dat`](https://github.com/jpatokal/openflights/blob/master/data/airports.dat)
+   into `data/airports.dat`.
+3. Run the pipeline in order, each reading the previous step's output:
+   ```bash
+   python fix_datetimes.py       # delta_ontime_clean.csv -> delta_ontime_with_datetimes.csv
+   python build_graph.py         # -> delta_rotation_graph.pkl
+   python add_coordinates.py     # joins airport coordinates onto the graph
+   python build_lean_artifacts.py  # -> data/legs_frame.pkl, data/airport_nodes.pkl
+   ```
+
 **Backend:**
 ```bash
 pip install -r requirements.txt
