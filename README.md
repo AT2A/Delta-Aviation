@@ -38,7 +38,8 @@ flights only, January 2025 – April 2026 (~1.27M flights, ~1,015 unique tail
 numbers).
 
 **Airport coordinates:** OpenFlights `airports.dat`, joined by IATA code,
-covering all 153 airports that appear as nodes in the graph.
+covering all 153 airports that appear as nodes in the graph. OpenFlights
+data is licensed under the [Open Database License (ODbL)](https://www.openflights.org/data.php).
 
 Each flight record carries scheduled and actual departure/arrival times,
 tail number, origin, destination, and `LateAircraftDelay` — the field used
@@ -247,7 +248,8 @@ place both in `data/`.
    as `data/delta_ontime_clean.csv` — this filtering/cleaning step is
    currently done by hand and isn't captured in a tracked script.
 2. Download [OpenFlights `airports.dat`](https://github.com/jpatokal/openflights/blob/master/data/airports.dat)
-   into `data/airports.dat`.
+   into `data/airports.dat`. OpenFlights data is licensed under the
+   [Open Database License (ODbL)](https://www.openflights.org/data.php).
 3. Run the pipeline in order, each reading the previous step's output:
    ```bash
    python fix_datetimes.py       # delta_ontime_clean.csv -> delta_ontime_with_datetimes.csv
