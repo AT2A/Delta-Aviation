@@ -34,7 +34,7 @@ function greatCircleInterpolate(lat1, lon1, lat2, lon2, frac) {
   const x = a * Math.cos(rlat1) * Math.cos(rlon1) + b * Math.cos(rlat2) * Math.cos(rlon2)
   const y = a * Math.cos(rlat1) * Math.sin(rlon1) + b * Math.cos(rlat2) * Math.sin(rlon2)
   const z = a * Math.sin(rlat1) + b * Math.sin(rlat2)
-  return [toDeg(Math.atan2(z, Math.sqrt(x * x + y * y))), toDeg(Math.atan2(y, x))]
+  return [toDeg(Math.atan2(z, Math.hypot(x, y))), toDeg(Math.atan2(y, x))]
 }
 
 // Statuses where the aircraft hasn't left `origin` yet -- position it there.
@@ -96,7 +96,7 @@ function hhmmToMinutes(hhmm) {
 }
 
 // Aircraft not currently in flight -- i.e. plausible to ground right now.
-const ELIGIBLE_STATUSES = ["taxiing_out", "taxiing_in", "parked", "not_yet_started"]
+const ELIGIBLE_STATUSES = new Set(["taxiing_out", "taxiing_in", "parked", "not_yet_started"])
 
 // Mirrors MapView.jsx's internal STATUS_COLOR map (MapView.jsx:14-22).
 // Keep these two lists in sync manually if aircraft statuses/colors change.
@@ -524,7 +524,7 @@ function Live() {
     return searchSnapshot.filter(a =>
       (!searchOrigin || a.origin === searchOrigin) &&
       (!searchDest || a.destination === searchDest) &&
-      (!eligibleOnly || ELIGIBLE_STATUSES.includes(a.status))
+      (!eligibleOnly || ELIGIBLE_STATUSES.has(a.status))
     )
   }, [searchSnapshot, searchOrigin, searchDest, eligibleOnly, searchActive])
 
@@ -559,6 +559,7 @@ function Live() {
 
         <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
           <button
+            type="button"
             onClick={togglePlaying}
             style={{
               border: `1px solid ${theme.border}`,
@@ -600,6 +601,7 @@ function Live() {
             }}
           />
           <button
+            type="button"
             onClick={toggleDemoMode}
             style={{
               border: demoMode ? `1px solid ${theme.successBorder}` : `1px solid ${theme.border}`,
@@ -616,6 +618,7 @@ function Live() {
             {demoMode ? "● Demo Mode" : "Demo Mode"}
           </button>
           <button
+            type="button"
             onClick={openTutorial}
             style={{
               border: `1px solid ${theme.border}`,
@@ -664,6 +667,7 @@ function Live() {
                 How to use Live Replay & Disruption
               </span>
               <button
+                type="button"
                 onClick={closeTutorial}
                 style={{ border: "none", background: "none", cursor: "pointer", fontSize: "18px", lineHeight: 1, color: theme.textMuted }}
               >
