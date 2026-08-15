@@ -118,7 +118,7 @@ const TUTORIAL_SECTIONS = [
   },
   {
     title: "Select an aircraft",
-    body: "Click any aircraft dot on the map to open its detail panel on the right. Dot color shows status — see the legend in the bottom-left of the map.",
+    body: "Click any aircraft dot on the map to open its detail panel on the right. Dot color shows status: see the legend in the bottom-left of the map.",
   },
   {
     title: "Cancel this flight",
@@ -126,7 +126,7 @@ const TUTORIAL_SECTIONS = [
   },
   {
     title: "Ground this aircraft",
-    body: "Pick a solver — Greedy is fast, Optimal searches harder for a better answer with a timeout — then click \"Ground this aircraft\" to see how many of that tail's remaining legs the network can recover with substitute aircraft, and which (if any) are left uncovered.",
+    body: "Pick a solver (Greedy is fast, Optimal searches harder for a better answer with a timeout), then click \"Ground this aircraft\" to see how many of that tail's remaining legs the network can recover with substitute aircraft, and which (if any) are left uncovered.",
   },
 ]
 

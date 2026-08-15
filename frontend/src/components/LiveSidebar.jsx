@@ -42,7 +42,7 @@ const DEMO_EXAMPLES = [
     time: "08:51",
     feature: "ground",
     label: "N992AT",
-    blurb: "4 orphaned legs — Greedy covers 3, Optimal covers all 4. Try switching solvers.",
+    blurb: "4 orphaned legs: Greedy covers 3, Optimal covers all 4. Try switching solvers.",
   },
   {
     tail_number: "N899AT",
@@ -50,7 +50,7 @@ const DEMO_EXAMPLES = [
     time: "10:18",
     feature: "ground",
     label: "N899AT",
-    blurb: "3 orphaned legs — Greedy covers 2, Optimal covers all 3.",
+    blurb: "3 orphaned legs (Greedy covers 2, Optimal covers all 3).",
   },
   {
     tail_number: "N928AT",
@@ -58,7 +58,7 @@ const DEMO_EXAMPLES = [
     time: "07:14",
     feature: "ground",
     label: "N928AT",
-    blurb: "5 orphaned legs, the biggest gap found — Greedy covers 3, Optimal recovers all 5.",
+    blurb: "5 orphaned legs, the biggest gap found: Greedy covers 3, Optimal recovers all 5.",
   },
 ]
 
@@ -185,7 +185,7 @@ function LiveSidebar({
               ? "Working..."
               : canCancel
                 ? "Cancel this flight"
-                : "Not yet departed — nothing to cancel"}
+                : "Not yet departed, nothing to cancel"}
           </button>
 
           <div style={{ marginTop: "20px" }}>
@@ -347,7 +347,7 @@ function LiveSidebar({
                     : "no substitute available"}
                 </div>
                 <div style={{ fontSize: "10px", color: theme.textMuted, marginTop: "6px" }}>
-                  Headline % assumes a 300 min modeling estimate per avoided cancellation — a stated assumption, not derived from data.
+                  Headline % assumes a 300 min modeling estimate per avoided cancellation. This is a stated assumption, not derived from data.
                 </div>
               </div>
 
@@ -357,7 +357,7 @@ function LiveSidebar({
 
               {disruptResult.ranked_candidates.length === 0 && (
                 <div style={{ fontSize: "13px", color: theme.textMuted }}>
-                  No viable substitute found — these legs would be cancelled.
+                  No viable substitute found; these legs would be cancelled.
                 </div>
               )}
 

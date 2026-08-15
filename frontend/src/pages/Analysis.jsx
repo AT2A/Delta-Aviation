@@ -242,7 +242,7 @@ function Analysis() {
             <br /><br />
             <span style={{ color: theme.textMuted, fontSize: "11.5px" }}>
               {zeroBtwCount} of {airports.length} airports register exactly zero centrality
-              (the dense cluster at the left edge) — spoke airports with no through-traffic
+              (the dense cluster at the left edge): spoke airports with no through-traffic
               never sit on the shortest path between two other airports. ATL's outlier value
               still compresses the rest of the network toward the left edge on this linear axis.{" "}
               {hideATL
@@ -310,7 +310,7 @@ function Analysis() {
           </span>
           <span style={{ fontSize: "11.5px", color: theme.textMuted, lineHeight: 1.5 }}>
             {zeroBtwCount} of {airports.length} airports tie at exactly zero betweenness
-            centrality — a structural artifact of hub-and-spoke topology: pure-spoke
+            centrality, a structural artifact of hub-and-spoke topology: pure-spoke
             airports never sit on the shortest path between two other airports, so they
             score identically regardless of traffic volume.
           </span>

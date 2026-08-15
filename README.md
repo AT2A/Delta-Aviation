@@ -28,6 +28,14 @@ black-box score: every design choice (weights, proxies, validation approach)
 is stated explicitly, stress-tested against synthetic edge cases, and
 benchmarked against a provably optimal solver.
 
+<table>
+<tr>
+<td width="33%"><img src="docs/screenshots/overview.png" alt="Network Overview page"/><br/><sub><b>Network Overview</b>: route map + headline stats</sub></td>
+<td width="33%"><img src="docs/screenshots/replay.png" alt="Live Replay and Disruption Simulator page"/><br/><sub><b>Live Replay & Disruption</b>: mid-playback with a cancellation's recovery candidates</sub></td>
+<td width="33%"><img src="docs/screenshots/analysis.png" alt="Propagation Analysis page"/><br/><sub><b>Propagation Analysis</b>: centrality vs. inheritance-rate scatter</sub></td>
+</tr>
+</table>
+
 ---
 
 ## Data
@@ -42,9 +50,9 @@ covering all 153 airports that appear as nodes in the graph. OpenFlights
 data is licensed under the [Open Database License (ODbL)](https://www.openflights.org/data.php).
 
 Each flight record carries scheduled and actual departure/arrival times,
-tail number, origin, destination, and `LateAircraftDelay` — the field used
-to detect inherited (vs. originated) delay and trace cascades through a
-tail number's rotation.
+tail number, origin, destination, and `LateAircraftDelay` (the field used
+to detect inherited vs. originated delay and trace cascades through a
+tail number's rotation).
 
 This is historical, batch-loaded data, not a live feed. It's precomputed
 into a graph once at startup and served from static tables (see
@@ -54,7 +62,7 @@ Architecture below).
 
 ## Architecture
 
-**Backend** — Python, FastAPI (`backend/main.py`)
+**Backend**: Python, FastAPI (`backend/main.py`)
 On startup, `load_data()` loads a precomputed flight-rotation graph (153
 airports, ~1.27M edges) and builds the tables the API needs: route
 statistics, betweenness centrality, per-tail flight sequences, airport
@@ -62,22 +70,22 @@ coordinates, and route durations. A 2-worker process pool handles the two
 disruption solvers so CPU-bound optimization work never blocks the main
 request-serving process.
 
-**Analysis layer** — Python, NetworkX, pandas (`analysis/`)
+**Analysis layer**: Python, NetworkX, pandas (`analysis/`)
 Pure, side-effect-free functions with no API dependencies, covering graph
 construction, cascade tracing, centrality analysis, and disruption
 simulation. Each module has its own manual validation block (`if __name__ ==
 "__main__":`) with hand-traced examples checked against real flights, not
 just unit tests against synthetic data.
 
-**Frontend** — React (Vite), deck.gl
+**Frontend**: React (Vite), deck.gl
 Three pages, sharing a common design system (Inter + JetBrains Mono, a
 consistent card-based light theme, dark mode support):
-- **Network Overview** (`/`) — the static network map and headline research
+- **Network Overview** (`/`): the static network map and headline research
   findings
-- **Live Replay & Disruption Simulator** (`/replay`) — a time-scrubbing
+- **Live Replay & Disruption Simulator** (`/replay`): a time-scrubbing
   replay of a real day's operations, with click-to-disrupt any flight or
   aircraft
-- **Propagation Analysis** (`/analysis`) — the core Phase 2 research findings,
+- **Propagation Analysis** (`/analysis`): the core Phase 2 research findings,
   visualized
 
 Routes render as true great-circle paths (not deck.gl's default stylized 3D
@@ -116,7 +124,7 @@ the query-time convention, requiring recent-landing candidates, excluding
 idle candidates entirely) and held every time: each variant moved only ~1%
 of scenarios into a harder outcome bucket relative to baseline. **The
 driver is schedule buffer baked into Delta's real timetable, not candidate
-availability.** This confirms the ATL finding above independently — the
+availability.** This confirms the ATL finding above independently. The
 network absorbs small shocks without needing to reroute much of anything.
 
 ### Mass disruption is a supply problem, not a coordination problem
@@ -145,16 +153,16 @@ myopic choices leg-by-leg.
 
 ## The disruption recovery engine
 
-### Feature 1 — Single-leg cancellation
+### Feature 1: Single-leg cancellation
 
 Given one cancelled flight, the engine finds every physically viable
 substitute aircraft and scores each one on a weighted combination of:
-- **Induced delay** — how late the substitute makes this specific flight
-- **Opportunity cost** — the real cost of pulling that aircraft away from
+- **Induced delay**: how late the substitute makes this specific flight
+- **Opportunity cost**, the real cost of pulling that aircraft away from
   its own remaining schedule (including the time it actually spends flying
   the substitute assignment, and repositioning back)
-- **Importance** — a proxy for how disruptive it is to touch this route at
-  all, built from real traffic volume and structural centrality, weighted
+- **Importance**, a proxy for how disruptive it is to touch this route at
+  all, built from real traffic volume and structural centrality and weighted
   toward centrality as a deliberate callback to the project's own Phase 2
   finding
 
@@ -164,7 +172,7 @@ major flights, or a balanced combination), implemented as one formula with
 five weight vectors, not five separate algorithms, so every mode remains
 aware of every factor.
 
-### Feature 2 — Whole-aircraft-down
+### Feature 2: Whole-aircraft-down
 
 When an entire aircraft is grounded, every remaining flight on its rotation
 becomes orphaned simultaneously, and no single substitute may be able to
@@ -174,8 +182,8 @@ whether a candidate should extend to cover more flights or hand off to a
 fresh search: the same tradeoff logic as Feature 1, applied recursively.
 
 Two solvers are available:
-- **Greedy** — fast, resolves segments in order
-- **Optimal** — a memoized dynamic-programming search over the full
+- **Greedy**: fast, resolves segments in order
+- **Optimal**: a memoized dynamic-programming search over the full
   assignment space, guaranteed to find the best possible outcome
 
 Both run in isolated worker processes with a timeout-and-fallback mechanism,
@@ -190,15 +198,15 @@ airlines don't publish their real dispatch/recovery actions. So this project
 doesn't claim to have found the objectively correct answer; it validates
 what *can* be validated:
 
-- **Monotonicity** — does the score always improve when any individual
+- **Monotonicity**: does the score always improve when any individual
   factor improves, holding everything else constant?
-- **Pareto-dominance** — does the ranking ever recommend a candidate that's
+- **Pareto-dominance**: does the ranking ever recommend a candidate that's
   strictly worse than another available candidate on every factor? (It
   never does, by construction, across all five ranking modes.)
-- **Weight sensitivity** — how much does the top recommendation change under
+- **Weight sensitivity**: how much does the top recommendation change under
   different, reasonable weightings? (Tested explicitly, reported honestly
   either way.)
-- **Cross-validation between independently built components** — Feature 1
+- **Cross-validation between independently built components.** Feature 1
   and Feature 2 compute overlapping quantities differently, and a real
   disagreement between them exposed a genuine bug, not just a design
   difference: fixing it shifted the zero-cost rate from 95.2% to 41.9%.
@@ -215,8 +223,8 @@ Stated explicitly rather than silently worked around:
   operationally legal in ways this system can't see.
 - **BTS data structurally excludes ferry/positioning flights.** An aircraft
   that's actually in active use repositioning between airports can appear
-  as "idle" in this dataset — a real, unresolved gap, corroborated by an
-  idle-fleet rate roughly 2x higher than Delta's real reported utilization.
+  as "idle" in this dataset. That's a real, unresolved gap, corroborated by
+  an idle-fleet rate roughly 2x higher than Delta's real reported utilization.
 - **No passenger-level data exists.** "Importance" and "connections missed"
   are both traffic/schedule-based proxies, not real passenger counts,
   explicitly labeled as such wherever they appear.
@@ -228,24 +236,24 @@ Stated explicitly rather than silently worked around:
 
 ## Running locally
 
-The backend needs two data artifacts at startup — `data/legs_frame.pkl` and
-`data/airport_nodes.pkl` (~163MB combined) — that aren't in this repo. Get
+The backend needs two data artifacts at startup, `data/legs_frame.pkl` and
+`data/airport_nodes.pkl` (~163MB combined), that aren't in this repo. Get
 them one of two ways:
 
-**Quick start — download the prebuilt artifacts (recommended)**
+**Quick start: download the prebuilt artifacts (recommended)**
 
 Download `legs_frame.pkl` and `airport_nodes.pkl` from the
 [latest release](https://github.com/AT2A/Delta-Aviation/releases/latest) and
 place both in `data/`.
 
-**From scratch — rebuild the pipeline yourself**
+**From scratch: rebuild the pipeline yourself**
 
 1. Get the BTS TranStats On-Time Performance data (Reporting Carrier
    On-Time Performance dataset,
    [transtats.bts.gov](https://www.transtats.bts.gov/Fields.asp?gnoyr_VQ=FGJ)),
    January 2025 – April 2026. BTS's download flow is per-month and manual;
    there's no scripted bulk fetch. Filter to Delta domestic flights and save
-   as `data/delta_ontime_clean.csv` — this filtering/cleaning step is
+   as `data/delta_ontime_clean.csv`. This filtering/cleaning step is
    currently done by hand and isn't captured in a tracked script.
 2. Download [OpenFlights `airports.dat`](https://github.com/jpatokal/openflights/blob/master/data/airports.dat)
    into `data/airports.dat`. OpenFlights data is licensed under the

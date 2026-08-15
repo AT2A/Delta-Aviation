@@ -21,7 +21,7 @@ function BottleneckPanel({ airports }) {
         Top Bottleneck Airports
       </div>
       <div style={{ fontSize: "11px", color: theme.textMuted, lineHeight: 1.4, marginBottom: "16px" }}>
-        Ranked by structural centrality — how often this airport sits on the
+        Ranked by structural centrality: how often this airport sits on the
         shortest path between other airports in Delta's network.
       </div>
 

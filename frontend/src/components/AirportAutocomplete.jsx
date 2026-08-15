@@ -82,7 +82,7 @@ function AirportAutocomplete({ value, onChangeText, onSelect, airports, placehol
               onMouseLeave={e => { e.currentTarget.style.background = "transparent" }}
             >
               <span style={{ fontFamily: "'JetBrains Mono', monospace", fontWeight: 700 }}>{a.Origin}</span>
-              {a.city && <span style={{ color: theme.textSecondary }}> — {a.city}</span>}
+              {a.city && <span style={{ color: theme.textSecondary }}> · {a.city}</span>}
             </div>
           ))}
         </div>
