@@ -1,0 +1,16 @@
+data/*.csv
+data/*.dat
+data/delta_rotation_graph.pkl
+data/info.txt
+frontend/
+node_modules/
+__pycache__/
+*.pyc
+venv/
+.venv/
+.git/
+.claude/
+_archive/
+logs/
+analysis/experiments/
+docs/

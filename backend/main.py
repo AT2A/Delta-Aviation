@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from pathlib import Path
+import os
 import pandas as pd
 import asyncio
 from functools import partial
@@ -24,7 +25,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 DATA_DIR = Path(__file__).parent.parent / "data"
 OPTIMAL_SOLVER_TIMEOUT_SECONDS = 20
-NUM_SOLVER_WORKERS = 2   # single source of truth for both pool size and the concurrency cap below
+NUM_SOLVER_WORKERS = int(os.environ.get("NUM_SOLVER_WORKERS", 2))   # single source of truth for both pool size and the concurrency cap below
 
 app = FastAPI()
 
