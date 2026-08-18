@@ -18,7 +18,7 @@ def build_flight_frame_from_graph(G):
     return pd.DataFrame(rows)
 
 def compute_route_delay_summary(df):
-    grouped = df.groupby(['Origin', 'Dest']).agg(
+    grouped = df.groupby(['Origin', 'Dest'], observed=True).agg(
         avg_delay=('ArrDelay', 'mean'),
         flight_count=('ArrDelay', 'count'),
         cancelled_count=('Cancelled', 'sum'),

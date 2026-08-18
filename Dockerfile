@@ -5,6 +5,7 @@ WORKDIR /app
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     NUM_SOLVER_WORKERS=2 \
+    ALLOWED_ORIGIN=http://localhost:5173 \
     PORT=8080
 
 COPY requirements.txt .

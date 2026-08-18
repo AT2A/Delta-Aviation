@@ -1,0 +1,30 @@
+# Source-upload exclusions for `gcloud run deploy --source .` / Cloud Build.
+# Based on .gitignore. The bare `data/` rule from .gitignore is NOT used
+# here: excluding a directory outright stops gcloudignore from descending
+# into it at all, which would silently defeat the `!data/...` negations
+# below. `data/*` excludes the same contents one level down without
+# blocking traversal, so the two artifacts the backend loads at startup
+# (data/legs_frame.pkl, data/airport_nodes.pkl) can be re-included.
+
+.git
+.gitignore
+.gcloudignore
+
+*.pkl
+*.csv
+__pycache__/
+*.pyc
+venv/
+node_modules/
+analysis/experiments/
+logs/
+.claude/
+_archive/
+
+# Backend-only deploy -- the frontend tree isn't needed in this build's
+# source upload at all (it deploys separately).
+frontend/
+
+data/*
+!data/legs_frame.pkl
+!data/airport_nodes.pkl

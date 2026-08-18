@@ -4,6 +4,7 @@ import {
   CartesianGrid, Tooltip, Legend, LabelList,
 } from "recharts"
 import { useTheme } from "../ThemeContext"
+import { API_BASE } from "../apiBase"
 
 const ATL = "ATL"
 const FL_CLUSTER = ["PBI", "FLL", "MIA", "TPA", "MCO"]
@@ -76,7 +77,7 @@ function Analysis() {
   const [hideATL, setHideATL] = useState(false)
 
   useEffect(() => {
-    fetch("/airports")
+    fetch(`${API_BASE}/airports`)
       .then(res => res.json())
       .then(data => {
         setAirports(data.airports)

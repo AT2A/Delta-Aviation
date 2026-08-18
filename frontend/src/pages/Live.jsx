@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, useCallback, useMemo } from "react"
 import MapView from "../components/MapView"
 import LiveSidebar from "../components/LiveSidebar"
 import { useTheme } from "../ThemeContext"
+import { API_BASE } from "../apiBase"
 
 const DEFAULT_MINUTES = 8 * 60 // 08:00
 const MAX_MINUTES = 1439
@@ -189,7 +190,7 @@ function Live() {
   const [eligibleOnly, setEligibleOnly] = useState(false)
 
   useEffect(() => {
-    fetch("/airports")
+    fetch(`${API_BASE}/airports`)
       .then(res => res.json())
       .then(data => setAirportOptions(data.airports))
   }, [])
@@ -202,7 +203,7 @@ function Live() {
   // per-frame network dependency and zero status-transition latency.
   useEffect(() => {
     const requestId = ++scheduleRequestId.current
-    fetch(`/schedule?date=${replayDate}`)
+    fetch(`${API_BASE}/schedule?date=${replayDate}`)
       .then(res => res.json())
       .then(data => {
         if (requestId !== scheduleRequestId.current) return
@@ -299,7 +300,7 @@ function Live() {
   const handleCancel = useCallback(() => {
     if (isDisrupting || !canCancel) return
     setIsDisrupting(true)
-    fetch("/disrupt", {
+    fetch(`${API_BASE}/disrupt`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -333,7 +334,7 @@ function Live() {
     setSelectedMode(newMode)
     if (disruptResult) {
       setIsDisrupting(true)
-      fetch("/disrupt", {
+      fetch(`${API_BASE}/disrupt`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -363,7 +364,7 @@ function Live() {
     if (isGrounding) return
     setAircraftDownResult(null)
     setIsGrounding(true)
-    fetch("/disrupt/aircraft-down", {
+    fetch(`${API_BASE}/disrupt/aircraft-down`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({

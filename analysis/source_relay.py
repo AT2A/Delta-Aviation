@@ -2,8 +2,8 @@ import pandas as pd
 
 
 def compute_source_relay_summary(df):
-    totals = df.groupby('Origin').size()
-    inherited = df.groupby('Origin')['LateAircraftDelay'].apply(lambda x: (x > 0).sum())
+    totals = df.groupby('Origin', observed=True).size()
+    inherited = df.groupby('Origin', observed=True)['LateAircraftDelay'].apply(lambda x: (x > 0).sum())
 
     summary = pd.DataFrame({
         'total_departures': totals,

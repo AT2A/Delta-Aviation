@@ -3,6 +3,7 @@ import MapView from "../components/MapView"
 import BottleneckPanel from "../components/BottleneckPanel"
 import AirportAutocomplete from "../components/AirportAutocomplete"
 import { useTheme } from "../ThemeContext"
+import { API_BASE } from "../apiBase"
 
 function Swatch({ color, round }) {
   return (
@@ -27,14 +28,14 @@ function Overview() {
   const [inheritedPct, setInheritedPct] = useState(null)
 
   useEffect(() => {
-    fetch("/airports")
+    fetch(`${API_BASE}/airports`)
       .then(res => res.json())
       .then(data => {
         setAirports(data.airports)
         setInheritedPct(data.network_inherited_delay_pct)
       })
 
-    fetch("/tails")
+    fetch(`${API_BASE}/tails`)
       .then(res => res.json())
       .then(data => setTails(data.tails))
   }, [])

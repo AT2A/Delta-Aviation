@@ -9,3 +9,4 @@ analysis/experiments/
 logs/
 .claude/
 _archive/
+.firebase/

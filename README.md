@@ -281,3 +281,29 @@ npm run dev
 
 The frontend expects the backend running on `localhost:8000` (proxied via
 Vite's dev server config).
+
+---
+
+## Deployment
+
+Live at:
+- **Frontend**: https://delta-aviation-505917.web.app (Firebase Hosting)
+- **Backend**: https://delta-aviation-backend-882250777278.us-central1.run.app (Cloud Run)
+
+Backend and frontend deploy as two independent services under the same GCP
+project (`delta-aviation-505917`), each redeployable without rebuilding the
+other:
+
+- The frontend's API base URL (`VITE_API_BASE_URL`, read via
+  `frontend/src/apiBase.js`) is baked in at build time from
+  `frontend/.env.production`; unset, it falls back to relative paths, which
+  is what makes local dev (Vite's dev-server proxy) work unchanged.
+- The backend's CORS allowlist (`ALLOWED_ORIGIN`, `backend/main.py`) is
+  read at runtime, so it can be updated with
+  `gcloud run services update delta-aviation-backend --set-env-vars ALLOWED_ORIGIN=<url>`
+  whenever the frontend's URL changes, with no backend rebuild.
+- The backend's Cloud Build source upload is scoped by `.gcloudignore`,
+  which explicitly re-includes the two data artifacts
+  (`data/legs_frame.pkl`, `data/airport_nodes.pkl`) the running service
+  loads at startup, while still excluding the raw CSVs and everything else
+  under `data/`.

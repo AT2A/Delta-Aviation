@@ -4,6 +4,7 @@ import { ScatterplotLayer, PathLayer, TextLayer } from "@deck.gl/layers"
 import { useState, useEffect, useMemo, memo } from "react"
 import "maplibre-gl/dist/maplibre-gl.css"
 import { useTheme } from "../ThemeContext"
+import { API_BASE } from "../apiBase"
 
 const INITIAL_VIEW = {
   longitude: -98.5,
@@ -35,15 +36,16 @@ function scoreRoutes(routes) {
 // Routes are static for the whole session -- they never change while the
 // app is running -- but MapView unmounts/remounts on every navigation
 // (React Router fully tears down page components), so without this, both
-// the ~35-50MB /routes fetch and the scoreRoutes() pass over it re-ran from
-// scratch on every visit to Overview or Live Replay, including navigating
-// away and back. Cached at module scope (survives unmount) instead of in
-// component state: the first caller kicks off the fetch+process and every
-// later caller (this mount or a future one) gets the same resolved promise.
+// the /routes fetch (~0.6MB for the network's 1,190 real routes) and the
+// scoreRoutes() pass over it re-ran from scratch on every visit to Overview
+// or Live Replay, including navigating away and back. Cached at module
+// scope (survives unmount) instead of in component state: the first caller
+// kicks off the fetch+process and every later caller (this mount or a
+// future one) gets the same resolved promise.
 let routesCache = null
 function getRoutesData() {
   if (!routesCache) {
-    routesCache = fetch("/routes")
+    routesCache = fetch(`${API_BASE}/routes`)
       .then(res => res.json())
       .then(data => scoreRoutes(data.routes.map(r => ({
         ...r,
@@ -82,17 +84,21 @@ function MapView({ aircraft, onAircraftClick, height = "100vh", selectedAirport 
   const [routes, setRoutes] = useState([])
   // Defaults to a cap, not null/"show all" -- a real Chrome Performance
   // trace this session showed the GPU spending 83% of frame time
-  // rasterizing this layer's ~23,409 alpha-blended, overlapping lines every
-  // single frame (re-triggered whenever the aircraft layer changes, i.e.
-  // every animation frame during playback), which is what was actually
-  // behind the "not smooth" complaints -- not JS, which measured under 7%
-  // of frame time. scoreRoutes sorts ascending, so slice(-routeLimit) below
-  // still keeps the highest-scored/most-important routes. Users can still
-  // drag the slider up to all 23,409 if they want the full network.
+  // rasterizing this layer's alpha-blended, overlapping lines every single
+  // frame (re-triggered whenever the aircraft layer changes, i.e. every
+  // animation frame during playback), which is what was actually behind
+  // the "not smooth" complaints -- not JS, which measured under 7% of
+  // frame time. That trace was taken against a backend bug that grouped
+  // Origin/Dest without observed=True, inflating the network to 23,409
+  // phantom routes; with it fixed, the real network is only ~1,190 routes
+  // -- under this cap, so it's currently a no-op safety ceiling rather
+  // than an active filter. scoreRoutes sorts ascending, so
+  // slice(-routeLimit) below still keeps the highest-scored/most-important
+  // routes if the network ever grows past the cap again.
   const [routeLimit, setRouteLimit] = useState(3000)
 
   useEffect(() => {
-    fetch("/airports/all")
+    fetch(`${API_BASE}/airports/all`)
       .then(res => res.json())
       .then(data => setAirports(data.airports))
 
@@ -103,8 +109,8 @@ function MapView({ aircraft, onAircraftClick, height = "100vh", selectedAirport 
   // rebuild every animation frame during playback, only when its own inputs
   // (routes/airports/routeLimit/theme/selectedAirport) actually change.
   // Route filtering here was the most expensive part of the old combined
-  // memo: up to 23,409 routes filtered/rebuilt on every frame it depended
-  // on `aircraft`, even though routes never change per-frame.
+  // memo: all of the network's routes filtered/rebuilt on every frame it
+  // depended on `aircraft`, even though routes never change per-frame.
   const staticLayers = useMemo(() => {
     const scopedRoutes = selectedAirport
       ? routes.filter(r => r.Origin === selectedAirport || r.Dest === selectedAirport)

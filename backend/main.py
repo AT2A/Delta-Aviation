@@ -26,12 +26,13 @@ from fastapi.middleware.cors import CORSMiddleware
 DATA_DIR = Path(__file__).parent.parent / "data"
 OPTIMAL_SOLVER_TIMEOUT_SECONDS = 20
 NUM_SOLVER_WORKERS = int(os.environ.get("NUM_SOLVER_WORKERS", 2))   # single source of truth for both pool size and the concurrency cap below
+ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "http://localhost:5173")   # lets the deployed frontend URL be set post-deploy via `gcloud run services update --set-env-vars`, without rebuilding this image
 
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=[ALLOWED_ORIGIN],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -155,8 +156,10 @@ def load_data():
         # faceting -- verified visually (network-wide view down to dense
         # regional close-ups, on both the longest routes in the network
         # (e.g. JFK-HNL, ~4300nm) and short/medium ones) before trimming
-        # this. Cuts /routes' path-data payload by ~3.75x (the dominant
-        # cost in a ~35-50MB response for 23,409 routes).
+        # this. Cuts /routes' path-data payload by ~2.75x (0.62MB vs. 1.7MB
+        # for the network's 1,190 real routes -- Origin/Dest used to be
+        # grouped without observed=True, which inflated this to 23,409
+        # phantom Origin-Dest pairs and a ~35-50MB response; fixed).
         return great_circle_path(o_lat, o_lon, d_lat, d_lon, num_points=8)
 
     routes_with_path = state['route_table'].reset_index()
